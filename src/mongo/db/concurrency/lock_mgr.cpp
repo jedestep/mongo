@@ -195,7 +195,6 @@ namespace mongo {
         return result.str();
     }
 
-
     /*---------- LockRequest functions ----------*/
 
 
@@ -243,6 +242,7 @@ namespace mongo {
         return result.str();
     }
 
+<<<<<<< HEAD
     bool LockRequest::isBlocked() const {
         return sleepCount > 0;
     }
@@ -1309,7 +1309,6 @@ namespace mongo {
             _activeTransactions[tx->txSlice].find(tx) == _activeTransactions[tx->txSlice].end()))
 #endif
         {
-
             throw AbortException(); // XXX should this be something else? ShutdownException?
         }
     }

@@ -250,4 +250,7 @@ namespace mongo {
         ~writelocktry();
         bool got() const { return _got; }
     };
+
+    // Defined in instance.cpp
+    extern bool useExperimentalDocLocking;
 }
