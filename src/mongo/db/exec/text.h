@@ -86,6 +86,9 @@ namespace mongo {
             // 2. Read the terms/scores from the text index.
             READING_TERMS,
 
+            // 2.5. If the query had negative terms, remove them.
+            FILTER_NEGATIVES,
+
             // 3. Return results to our parent.
             RETURNING_RESULTS,
 
@@ -107,6 +110,18 @@ namespace mongo {
         PlanStageStats* getStats();
 
         static const char* kStageType;
+    protected:
+        // Comparator class for ScoreMap
+        // Maybe should be in diskloc
+        class ScoreMapCompare {
+            public:
+                bool operator()(const DiskLoc& x, const DiskLoc& y) {
+                    return x < y;
+                }
+        };
+
+        // Maps from diskloc -> aggregate score for doc.
+        typedef map<DiskLoc, double, ScoreMapCompare> ScoreMap;
 
     private:
         /**
@@ -121,11 +136,20 @@ namespace mongo {
         StageState readFromSubScanners(WorkingSetID* out);
 
         /**
+         * Helper method to build an index scan and insert it into the given vector.
+         */
+        void addScanner(OwnedPointerVector<PlanStage>* vec, const string& term);
+        /**
          * Helper called from readFromSubScanners to update aggregate score with a new-found (term,
          * score) pair for this document.  Also rejects documents that don't match this stage's
          * filter.
          */
-        void addTerm(const BSONObj& key, const DiskLoc& loc);
+        void addTerm(const BSONObj& key, const DiskLoc& loc, ScoreMap* sm);
+
+        /**
+         * Removes any results that were in a negative scan from the result set.
+         */
+        StageState filterNegatives(WorkingSetID* out);
 
         /**
          * Possibly return a result.  FYI, this may perform a fetch directly if it is needed to
@@ -155,15 +179,21 @@ namespace mongo {
         // Used in INIT_SCANS and READING_TERMS.  The index scans we're using to retrieve text
         // terms.
         OwnedPointerVector<PlanStage> _scanners;
+        OwnedPointerVector<PlanStage> _negScanners;
+        OwnedPointerVector<PlanStage>* _curScanner;
 
         // Which _scanners are we currently reading from?
         size_t _currentIndexScanner;
+        bool _startedNeg;
 
         // Temporary score data filled out by sub-scans.  Used in READING_TERMS and
         // RETURNING_RESULTS.
-        // Maps from diskloc -> aggregate score for doc.
-        typedef unordered_map<DiskLoc, double, DiskLoc::Hasher> ScoreMap;
         ScoreMap _scores;
+        // In queries with negative terms, we do an index scan for each one 
+        ScoreMap _negScores;
+        // Set difference of pos and neg scores
+        ScoreMap _filteredScores;
+        ScoreMap* _curScoreMap;
         ScoreMap::const_iterator _scoreIterator;
     };
 
