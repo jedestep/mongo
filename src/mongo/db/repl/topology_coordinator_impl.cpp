@@ -26,15 +26,22 @@
  *    it in the license file.
  */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/topology_coordinator_impl.h"
 
 #include "mongo/db/operation_context.h"
+#include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/member.h"
-#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/rs_sync.h" // maxSyncSourceLagSecs
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     TopologyCoordinatorImpl::TopologyCoordinatorImpl() :
@@ -266,6 +273,7 @@ namespace repl {
 
         // Verify that replica set names match
         std::string rshb = std::string(cmdObj.getStringField("replSetHeartbeat"));
+        const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if (replSettings.ourSetName() != rshb) {
             *result = Status(ErrorCodes::BadValue, "repl set names do not match");
             log() << "replSet set names do not match, our cmdline: " << replSettings.replSet
@@ -425,7 +433,7 @@ namespace repl {
                 (latestOp - highestPriority->hbinfo().opTime.getSecs()) << " seconds behind";
 
             // Are we primary?
-            if (primary->h().isSelf()) {
+            if (isSelf(primary->h())) {
                 // replSetStepDown tries to acquire the same lock
                 // msgCheckNewState takes, so we can't call replSetStepDown on
                 // ourselves.

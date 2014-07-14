@@ -107,6 +107,9 @@ namespace mongo {
     PlanStage::StageState AndHashStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         // Fast-path for one of our children being EOF immediately.  We work each child a few times.
@@ -500,6 +503,10 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> AndHashStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* AndHashStage::getStats() {
         _commonStats.isEOF = isEOF();
 
@@ -520,6 +527,14 @@ namespace mongo {
         }
 
         return ret.release();
+    }
+
+    const CommonStats* AndHashStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* AndHashStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

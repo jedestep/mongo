@@ -51,14 +51,6 @@ namespace repl {
     class ReplSetSeedList;
     class ReplSetHealthPollTask;
 
-    class ReplicationStartSynchronizer {
-    public:
-        ReplicationStartSynchronizer() : indexRebuildDone(false) {}
-        boost::mutex mtx;
-        bool indexRebuildDone;
-        boost::condition cond;
-    };
-
     // information about the entire replset, such as the various servers in the set, and their state
     /* note: We currently do not free mem when the set goes away - it is assumed the replset is a
              singleton and long lived.
@@ -73,7 +65,6 @@ namespace repl {
         static StartupStatus startupStatus;
         static DiagStr startupStatusMsg;
         static string stateAsHtml(MemberState state);
-        static ReplicationStartSynchronizer rss;
 
         /* todo thread */
         void msgUpdateHBInfo(HeartbeatInfo);
@@ -82,6 +73,14 @@ namespace repl {
          * Updates the lastHeartbeatRecv of Member with the given id.
          */
         void msgUpdateHBRecv(unsigned id, time_t newTime);
+
+        void electCmdReceived(const StringData& set,
+                              unsigned whoid,
+                              int cfgver,
+                              const OID& round,
+                              BSONObjBuilder* result) {
+            elect.electCmdReceived(set, whoid, cfgver, round, result);
+        }
 
         StateBox box;
 
@@ -93,7 +92,7 @@ namespace repl {
         // hash we use to make sure we are reading the right flow of ops and aren't on
         // an out-of-date "fork"
         long long lastH; 
-        bool forceSyncFrom(const string& host, string& errmsg, BSONObjBuilder& result);
+        Status forceSyncFrom(const string& host, BSONObjBuilder* result);
         // Check if the current sync target is suboptimal. This must be called while holding a mutex
         // that prevents the sync source from changing.
         bool shouldChangeSyncTarget(const OpTime& target) const;
@@ -258,7 +257,7 @@ namespace repl {
         bool setMaintenanceMode(const bool inc);
 
         // Records a new slave's id in the GhostSlave map, at handshake time.
-        bool registerSlave(const BSONObj& rid, const int memberId);
+        bool registerSlave(const OID& rid, const int memberId);
     private:
         Member* head() const { return _members.head(); }
     public:
@@ -274,8 +273,7 @@ namespace repl {
         void _getTargets(list<Target>&, int &configVersion);
         void getTargets(list<Target>&, int &configVersion);
         void startThreads();
-        friend class FeedbackThread;
-        friend class CmdReplSetElect;
+        friend class LegacyReplicationCoordinator;
         friend class Member;
         friend class Manager;
         friend class Consensus;

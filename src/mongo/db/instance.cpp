@@ -28,16 +28,10 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
-#include <boost/filesystem/operations.hpp>
 #include <boost/thread/thread.hpp>
 #include <fstream>
-#if defined(_WIN32)
-#include <io.h>
-#else
-#include <sys/file.h>
-#endif
 
 #include "mongo/base/status.h"
 #include "mongo/bson/util/atomic_int.h"
@@ -53,9 +47,6 @@
 #include "mongo/db/dbhelpers.h"
 #include "mongo/db/dbmessage.h"
 #include "mongo/db/storage/storage_engine.h"
-#include "mongo/db/storage/mmap_v1/dur_commitjob.h"
-#include "mongo/db/storage/mmap_v1/dur_journal.h"
-#include "mongo/db/storage/mmap_v1/dur_recover.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/global_optime.h"
 #include "mongo/db/global_environment_experiment.h"
@@ -66,7 +57,7 @@
 #include "mongo/db/matcher/matcher.h"
 #include "mongo/db/mongod_options.h"
 #include "mongo/db/namespace_string.h"
-#include "mongo/db/ops/count.h"
+#include "mongo/db/commands/count.h"
 #include "mongo/db/ops/delete_executor.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/ops/insert.h"
@@ -85,14 +76,16 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
-#include "mongo/util/file_allocator.h"
 #include "mongo/util/gcov.h"
 #include "mongo/util/goodies.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mongoutils/str.h"
 #include "mongo/util/time_support.h"
 
 namespace mongo {
     
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
+
     // for diaglog
     inline void opread(Message& m) { if( _diaglog.getLevel() & 2 ) _diaglog.readop((char *) m.singleData(), m.header()->len); }
     inline void opwrite(Message& m) { if( _diaglog.getLevel() & 1 ) _diaglog.writeop((char *) m.singleData(), m.header()->len); }
@@ -108,14 +101,10 @@ namespace mongo {
 
     string dbExecCommand;
 
-    int lockFile = 0;
-#ifdef _WIN32
-    HANDLE lockFileHandle;
-#endif
 
     MONGO_FP_DECLARE(rsStopGetMore);
 
-    void inProgCmd( Message &m, DbResponse &dbresponse ) {
+    static void inProgCmd( Message &m, DbResponse &dbresponse ) {
         DbMessage d(m);
         QueryMessage q(d);
         BSONObjBuilder b;
@@ -160,7 +149,10 @@ namespace mongo {
                     }
                     verify( co );
                     if( all || co->displayInCurop() ) {
-                        BSONObj info = co->info();
+                        BSONObjBuilder infoBuilder;
+                        co->reportState(&infoBuilder);
+
+                        const BSONObj info = infoBuilder.obj();
                         if ( all || m.matches( info )) {
                             vals.push_back( info );
                         }
@@ -480,12 +472,14 @@ namespace mongo {
                     shouldLog = true;
                 }
             }
-            catch ( UserException& ue ) {
+            catch (const UserException& ue) {
+                setLastError(ue.getCode(), ue.getInfo().msg.c_str());
                 LOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
                        << ue.toString() << endl;
                 debug.exceptionInfo = ue.getInfo();
             }
-            catch ( AssertionException& e ) {
+            catch (const AssertionException& e) {
+                setLastError(e.getCode(), e.getInfo().msg.c_str());
                 LOG(3) << " Caught Assertion in " << opToString(op) << ", continuing "
                        << e.toString() << endl;
                 debug.exceptionInfo = e.getInfo();
@@ -569,7 +563,7 @@ namespace mongo {
         DbMessage d(m);
         NamespaceString ns(d.getns());
         uassertStatusOK( userAllowedWriteNS( ns ) );
-        op.debug().ns = ns.ns();
+        op.debug().ns = ns.ns().c_str();
         int flags = d.pullInt();
         BSONObj query = d.nextJsObj();
 
@@ -605,19 +599,21 @@ namespace mongo {
         UpdateExecutor executor(&request, &op.debug());
         uassertStatusOK(executor.prepare());
 
-        Lock::DBWrite lk(txn->lockState(), ns.ns());
+        Lock::DBWrite lk(txn->lockState(), ns.ns(), useExperimentalDocLocking);
+        WriteUnitOfWork wunit(txn->recoveryUnit());
 
         // if this ever moves to outside of lock, need to adjust check
         // Client::Context::_finishInit
         if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
             return;
 
-        Client::Context ctx( ns );
+        Client::Context ctx(txn,  ns );
 
         UpdateResult res = executor.execute(txn, ctx.db());
 
         // for getlasterror
         lastError.getSafe()->recordUpdate( res.existing , res.numMatched , res.upserted );
+        wunit.commit();
     }
 
     void receivedDelete(OperationContext* txn, Message& m, CurOp& op) {
@@ -625,7 +621,7 @@ namespace mongo {
         NamespaceString ns(d.getns());
         uassertStatusOK( userAllowedWriteNS( ns ) );
 
-        op.debug().ns = ns.ns();
+        op.debug().ns = ns.ns().c_str();
         int flags = d.pullInt();
         bool justOne = flags & RemoveOption_JustOne;
         bool broadcast = flags & RemoveOption_Broadcast;
@@ -646,16 +642,18 @@ namespace mongo {
         DeleteExecutor executor(&request);
         uassertStatusOK(executor.prepare());
         Lock::DBWrite lk(txn->lockState(), ns.ns());
+        WriteUnitOfWork wunit(txn->recoveryUnit());
 
         // if this ever moves to outside of lock, need to adjust check Client::Context::_finishInit
         if ( ! broadcast && handlePossibleShardedMessage( m , 0 ) )
             return;
 
-        Client::Context ctx(ns);
+        Client::Context ctx(txn, ns);
 
         long long n = executor.execute(txn, ctx.db());
         lastError.getSafe()->recordDelete( n );
         op.debug().ndeleted = n;
+        wunit.commit();
     }
 
     QueryResult* emptyMoreResult(long long);
@@ -699,7 +697,8 @@ namespace mongo {
                         last = getLastSetOptime();
                     }
                     else {
-                        repl::waitForOptimeChange(last, 1000/*ms*/);
+                        repl::getGlobalReplicationCoordinator()->waitUpToOneSecondForOptimeChange(
+                                last);
                     }
                 }
 
@@ -844,11 +843,12 @@ namespace mongo {
             try {
                 checkAndInsert(txn, ctx, ns, objs[i]);
                 txn->recoveryUnit()->commitIfNeeded();
-            } catch (const UserException&) {
+            } catch (const UserException& ex) {
                 if (!keepGoing || i == objs.size()-1){
                     globalOpCounters.incInsertInWriteLock(i);
                     throw;
                 }
+                setLastError(ex.getCode(), ex.getInfo().msg.c_str());
                 // otherwise ignore and keep going
             }
         }
@@ -892,7 +892,8 @@ namespace mongo {
         if ( handlePossibleShardedMessage( m , 0 ) )
             return;
 
-        Client::Context ctx(ns);
+        WriteUnitOfWork wunit(txn->recoveryUnit());
+        Client::Context ctx(txn, ns);
 
         if (multi.size() > 1) {
             const bool keepGoing = d.reservedField() & InsertOption_ContinueOnError;
@@ -902,29 +903,7 @@ namespace mongo {
             globalOpCounters.incInsertInWriteLock(1);
             op.debug().ninserted = 1;
         }
-    }
-
-    /* returns true if there is data on this server.  useful when starting replication.
-       local database does NOT count except for rsoplog collection.
-       used to set the hasData field on replset heartbeat command response
-    */
-    bool replHasDatabases(OperationContext* txn) {
-        vector<string> names;
-        globalStorageEngine->listDatabases( &names );
-
-        if( names.size() >= 2 ) return true;
-        if( names.size() == 1 ) {
-            if( names[0] != "local" )
-                return true;
-            // we have a local database.  return true if oplog isn't empty
-            {
-                Lock::DBRead lk(txn->lockState(), repl::rsoplog);
-                BSONObj o;
-                if( Helpers::getFirst(txn, repl::rsoplog, o) )
-                    return true;
-            }
-        }
-        return false;
+        wunit.commit();
     }
 
     DBDirectClient::DBDirectClient() 
@@ -1013,19 +992,10 @@ namespace {
         return (unsigned long long )res;
     }
 
-    DBClientBase * createDirectClient() {
+    DBClientBase* createDirectClient() {
         return new DBDirectClient();
     }
 
-    MONGO_INITIALIZER_GENERAL(CreateJSDirectClient,
-                              ("StorageEngineInit"),
-                              MONGO_NO_DEPENDENTS)
-        (InitializerContext* context) {
-
-        directDBClient = createDirectClient();
-
-        return Status::OK();
-    }
 
     mongo::mutex exitMutex("exit");
     AtomicUInt numExitCalls = 0;
@@ -1034,7 +1004,9 @@ namespace {
         return numExitCalls > 0;
     }
 
-    static void shutdownServer() {
+    static void shutdownServer(OperationContext* txn) {
+        // Must hold global lock to get to here
+        invariant(txn->lockState()->isW());
 
         log() << "shutdown: going to close listening sockets..." << endl;
         ListeningSockets::get()->closeAll();
@@ -1046,85 +1018,44 @@ namespace {
         log() << "shutdown: going to close sockets..." << endl;
         boost::thread close_socket_thread( stdx::bind(MessagingPort::closeAllSockets, 0) );
 
-        // wait until file preallocation finishes
-        // we would only hang here if the file_allocator code generates a
-        // synchronous signal, which we don't expect
-        log() << "shutdown: waiting for fs preallocator..." << endl;
-        FileAllocator::get()->waitUntilFinished();
-
-        if (storageGlobalParams.dur) {
-            log() << "shutdown: lock for final commit..." << endl;
-            {
-                int n = 10;
-                while( 1 ) {
-                    // we may already be in a read lock from earlier in the call stack, so do read lock here 
-                    // to be consistent with that.
-                    OperationContextImpl txn;
-                    readlocktry w(txn.lockState(), 20000);
-                    if( w.got() ) {
-                        log() << "shutdown: final commit..." << endl;
-                        getDur().commitNow(&txn);
-                        break;
-                    }
-                    if( --n <= 0 ) {
-                        log() << "shutdown: couldn't acquire write lock, aborting" << endl;
-                        mongoAbort("couldn't acquire write lock");
-                    }
-                    log() << "shutdown: waiting for write lock..." << endl;
-                }
-            }
-            globalStorageEngine->flushAllFiles(true);
-        }
-
-        log() << "shutdown: closing all files..." << endl;
-        stringstream ss3;
-        MemoryMappedFile::closeAllFiles( ss3 );
-        log() << ss3.str() << endl;
-
-        if (storageGlobalParams.dur) {
-            dur::journalCleanup(true);
-        }
-
-#if !defined(__sunos__)
-        if ( lockFile ) {
-            log() << "shutdown: removing fs lock..." << endl;
-            /* This ought to be an unlink(), but Eliot says the last
-               time that was attempted, there was a race condition
-               with acquirePathLock().  */
-#ifdef _WIN32
-            if( _chsize( lockFile , 0 ) )
-                log() << "couldn't remove fs lock " << errnoWithDescription(_doserrno) << endl;
-            CloseHandle(lockFileHandle);
-#else
-            if( ftruncate( lockFile , 0 ) )
-                log() << "couldn't remove fs lock " << errnoWithDescription() << endl;
-            flock( lockFile, LOCK_UN );
-#endif
-        }
-#endif
+        globalStorageEngine->cleanShutdown(txn);
     }
 
     void exitCleanly( ExitCode code ) {
         getGlobalEnvironment()->setKillAllOperations();
-        if (repl::getGlobalReplicationCoordinator()->getReplicationMode() ==
-                repl::ReplicationCoordinator::modeReplSet) {
-            repl::theReplSet->shutdown();
+
+        repl::getGlobalReplicationCoordinator()->shutdown();
+
+        OperationContextImpl txn;
+        Lock::GlobalWrite lk(txn.lockState());
+        log() << "now exiting" << endl;
+
+        // Execute the graceful shutdown tasks, such as flushing the outstanding journal and data 
+        // files, close sockets, etc.
+        try {
+            shutdownServer(&txn);
+        }
+        catch (const DBException& ex) {
+            severe() << "shutdown failed with DBException " << ex;
+            std::terminate();
+        }
+        catch (const std::exception& ex) {
+            severe() << "shutdown failed with std::exception: " << ex.what();
+            std::terminate();
+        }
+        catch (...) {
+            severe() << "shutdown failed with exception";
+            std::terminate();
         }
 
-        {
-            Lock::GlobalWrite lk(&cc().lockState());
-            log() << "now exiting" << endl;
-            dbexit( code );
-        }
+        dbexit( code );
     }
 
     /* not using log() herein in case we are already locked */
     NOINLINE_DECL void dbexit( ExitCode rc, const char *why ) {
-
         flushForGcov();
 
-        Client * c = currentClient.get();
-        audit::logShutdown(c);
+        audit::logShutdown(currentClient.get());
         {
             scoped_lock lk( exitMutex );
             if ( numExitCalls++ > 0 ) {
@@ -1133,19 +1064,11 @@ namespace {
                     ::_exit( rc );
                 }
                 log() << "dbexit: " << why << "; exiting immediately";
-                if ( c ) c->shutdown();
                 ::_exit( rc );
             }
         }
 
         log() << "dbexit: " << why;
-
-        try {
-            shutdownServer(); // gracefully shutdown instance
-        }
-        catch ( ... ) {
-            severe() << "shutdown failed with exception";
-        }
 
 #if defined(_DEBUG)
         try {
@@ -1154,174 +1077,17 @@ namespace {
         catch (...) { }
 #endif
 
-        // block the dur thread from doing any work for the rest of the run
-        LOG(2) << "shutdown: groupCommitMutex" << endl;
-        SimpleMutex::scoped_lock lk(dur::commitJob.groupCommitMutex);
-
 #ifdef _WIN32
         // Windows Service Controller wants to be told when we are down,
         //  so don't call ::_exit() yet, or say "really exiting now"
         //
         if ( rc == EXIT_WINDOWS_SERVICE_STOP ) {
-            if ( c ) c->shutdown();
             return;
         }
 #endif
         log() << "dbexit: really exiting now";
-        if ( c ) c->shutdown();
         ::_exit(rc);
     }
-
-#if !defined(__sunos__)
-    void writePid(int fd) {
-        stringstream ss;
-        ss << ProcessId::getCurrent() << endl;
-        string s = ss.str();
-        const char * data = s.c_str();
-#ifdef _WIN32
-        verify( _write( fd, data, strlen( data ) ) );
-#else
-        verify( write( fd, data, strlen( data ) ) );
-#endif
-    }
-
-    void acquirePathLock(bool doingRepair) {
-        string name = (boost::filesystem::path(storageGlobalParams.dbpath) / "mongod.lock").string();
-
-        bool oldFile = false;
-
-        if ( boost::filesystem::exists( name ) && boost::filesystem::file_size( name ) > 0 ) {
-            oldFile = true;
-        }
-
-#ifdef _WIN32
-        lockFileHandle = CreateFileA( name.c_str(), GENERIC_READ | GENERIC_WRITE,
-            0 /* do not allow anyone else access */, NULL, 
-            OPEN_ALWAYS /* success if fh can open */, 0, NULL );
-
-        if (lockFileHandle == INVALID_HANDLE_VALUE) {
-            DWORD code = GetLastError();
-            char *msg;
-            FormatMessageA(FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM,
-                NULL, code, MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
-                (LPSTR)&msg, 0, NULL);
-            string m = msg;
-            str::stripTrailing(m, "\r\n");
-            uasserted( 13627 , str::stream() << "Unable to create/open lock file: " << name << ' ' << m << ". Is a mongod instance already running?" );
-        }
-        lockFile = _open_osfhandle((intptr_t)lockFileHandle, 0);
-#else
-        lockFile = open( name.c_str(), O_RDWR | O_CREAT , S_IRWXU | S_IRWXG | S_IRWXO );
-        if( lockFile <= 0 ) {
-            uasserted( 10309 , str::stream() << "Unable to create/open lock file: " << name << ' ' << errnoWithDescription() << " Is a mongod instance already running?" );
-        }
-        if (flock( lockFile, LOCK_EX | LOCK_NB ) != 0) {
-            close ( lockFile );
-            lockFile = 0;
-            uassert( 10310 ,  "Unable to lock file: " + name + ". Is a mongod instance already running?",  0 );
-        }
-#endif
-
-        if ( oldFile ) {
-            // we check this here because we want to see if we can get the lock
-            // if we can't, then its probably just another mongod running
-            
-            string errmsg;
-            if (doingRepair && dur::haveJournalFiles()) {
-                errmsg = "************** \n"
-                         "You specified --repair but there are dirty journal files. Please\n"
-                         "restart without --repair to allow the journal files to be replayed.\n"
-                         "If you wish to repair all databases, please shutdown cleanly and\n"
-                         "run with --repair again.\n"
-                         "**************";
-            }
-            else if (storageGlobalParams.dur) {
-                if (!dur::haveJournalFiles(/*anyFiles=*/true)) {
-                    // Passing anyFiles=true as we are trying to protect against starting in an
-                    // unclean state with the journal directory unmounted. If there are any files,
-                    // even prealloc files, then it means that it is mounted so we can continue.
-                    // Previously there was an issue (SERVER-5056) where we would fail to start up
-                    // if killed during prealloc.
-
-                    vector<string> dbnames;
-                    globalStorageEngine->listDatabases( &dbnames );
-
-                    if ( dbnames.size() == 0 ) {
-                        // this means that mongod crashed
-                        // between initial startup and when journaling was initialized
-                        // it is safe to continue
-                    }
-                    else {
-                        errmsg = str::stream()
-                            << "************** \n"
-                            << "old lock file: " << name << ".  probably means unclean shutdown,\n"
-                            << "but there are no journal files to recover.\n"
-                            << "this is likely human error or filesystem corruption.\n"
-                            << "please make sure that your journal directory is mounted.\n"
-                            << "found " << dbnames.size() << " dbs.\n"
-                            << "see: http://dochub.mongodb.org/core/repair for more information\n"
-                            << "*************";
-                    }
-
-                }
-            }
-            else {
-                if (!dur::haveJournalFiles() && !doingRepair) {
-                    errmsg = str::stream()
-                             << "************** \n"
-                             << "Unclean shutdown detected.\n"
-                             << "Please visit http://dochub.mongodb.org/core/repair for recovery instructions.\n"
-                             << "*************";
-                }
-            }
-
-            if (!errmsg.empty()) {
-                cout << errmsg << endl;
-#ifdef _WIN32
-                CloseHandle( lockFileHandle );
-#else
-                close ( lockFile );
-#endif
-                lockFile = 0;
-                uassert( 12596 , "old lock file" , 0 );
-            }
-        }
-
-        // Not related to lock file, but this is where we handle unclean shutdown
-        if (!storageGlobalParams.dur && dur::haveJournalFiles()) {
-            cout << "**************" << endl;
-            cout << "Error: journal files are present in journal directory, yet starting without journaling enabled." << endl;
-            cout << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
-            cout << "**************" << endl;
-            uasserted(13597, "can't start without --journal enabled when journal/ files are present");
-        }
-
-#ifdef _WIN32
-        uassert( 13625, "Unable to truncate lock file", _chsize(lockFile, 0) == 0);
-        writePid( lockFile );
-        _commit( lockFile );
-#else
-        uassert( 13342, "Unable to truncate lock file", ftruncate(lockFile, 0) == 0);
-        writePid( lockFile );
-        fsync( lockFile );
-        flushMyDirectory(name);
-#endif
-    }
-#else
-    void acquirePathLock(bool) {
-        // TODO - this is very bad that the code above not running here.
-
-        // Not related to lock file, but this is where we handle unclean shutdown
-        if (!storageGlobalParams.dur && dur::haveJournalFiles()) {
-            cout << "**************" << endl;
-            cout << "Error: journal files are present in journal directory, yet starting without --journal enabled." << endl;
-            cout << "It is recommended that you start with journaling enabled so that recovery may occur." << endl;
-            cout << "Alternatively (not recommended), you can backup everything, then delete the journal files, and run --repair" << endl;
-            cout << "**************" << endl;
-            uasserted(13618, "can't start without --journal enabled when journal/ files are present");
-        }
-    }
-#endif
 
     // ----- BEGIN Diaglog -----
     DiagLog::DiagLog() : f(0) , level(0), mutex("DiagLog") { 

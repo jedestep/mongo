@@ -1,7 +1,7 @@
 // index_create.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/catalog/index_create.h"
 
 #include "mongo/base/error_codes.h"
@@ -43,10 +45,13 @@
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/progress_meter.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kIndexing);
 
     /**
      * Add the provided (obj, dl) pair to the provided index.
@@ -99,7 +104,7 @@ namespace mongo {
         unsigned long long n = 0;
         unsigned long long numDropped = 0;
 
-        auto_ptr<Runner> runner(InternalPlanner::collectionScan(ns,collection));
+        auto_ptr<Runner> runner(InternalPlanner::collectionScan(txn,ns,collection));
 
         std::string idxName = descriptor->indexName();
 
@@ -284,7 +289,6 @@ namespace mongo {
             }
         }
 
-        verify( !btreeState->head().isNull() );
         LOG(0) << "build index done.  scanned " << n << " total records. "
                << t.millis() / 1000.0 << " secs" << endl;
 

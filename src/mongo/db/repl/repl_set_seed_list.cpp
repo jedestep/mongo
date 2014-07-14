@@ -26,11 +26,14 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/repl_set_seed_list.h"
 
 #include <boost/thread.hpp>
 #include <iostream>
 
+#include "mongo/db/repl/isself.h"
 #include "mongo/db/repl/master_slave.h"
 #include "mongo/db/repl/oplog.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
@@ -40,13 +43,16 @@
 #include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     /** @param cfgString <setname>/<seedhost1>,<seedhost2> */
     void parseReplSetSeedList(const std::string& cfgString,
-                              string& setname,
-                              vector<HostAndPort>& seeds,
-                              set<HostAndPort>& seedSet) {
+                              std::string& setname,
+                              std::vector<HostAndPort>& seeds,
+                              std::set<HostAndPort>& seedSet) {
         const char *p = cfgString.c_str();
         const char *slash = strchr(p, '/');
         if( slash )
@@ -78,7 +84,7 @@ namespace repl {
                         seedSet.count(m) == 0);
                 seedSet.insert(m);
                 //uassert(13101, "can't use localhost in replset host list", !m.isLocalHost());
-                if( m.isSelf() ) {
+                if (isSelf(m)) {
                     LOG(1) << "replSet ignoring seed " << m.toString() << " (=self)" << rsLog;
                 }
                 else

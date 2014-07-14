@@ -32,7 +32,7 @@
    to an open socket (or logical connection if pooling on sockets) from a client.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/client.h"
 
@@ -54,7 +54,7 @@
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/operation_context.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/storage_options.h"
@@ -64,8 +64,8 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/concurrency/thread_name.h"
 #include "mongo/util/file_allocator.h"
-#include "mongo/util/mongoutils/checksum.h"
 #include "mongo/util/mongoutils/str.h"
+
 
 namespace mongo {
 
@@ -162,23 +162,27 @@ namespace mongo {
     }
 
     BSONObj CachedBSONObjBase::_tooBig = fromjson("{\"$msg\":\"query not recording (too large)\"}");
-    Client::Context::Context(const std::string& ns , Database * db) :
-        _client( currentClient.get() ), 
-        _justCreated(false),
-        _doVersion( true ),
-        _ns( ns ), 
-        _db(db)
-    {
+
+    Client::Context::Context(OperationContext* txn, const std::string& ns, Database * db)
+        : _client( currentClient.get() ), 
+          _justCreated(false),
+          _doVersion( true ),
+          _ns( ns ), 
+          _db(db),
+          _txn(txn) {
 
     }
 
-    Client::Context::Context(const string& ns, bool doVersion) :
-        _client( currentClient.get() ), 
-        _justCreated(false), // set for real in finishInit
-        _doVersion(doVersion),
-        _ns( ns ), 
-        _db(0) 
-    {
+    Client::Context::Context(OperationContext* txn,
+                             const string& ns,
+                             bool doVersion)
+        : _client( currentClient.get() ), 
+          _justCreated(false), // set for real in finishInit
+          _doVersion(doVersion),
+          _ns( ns ), 
+          _db(NULL),
+          _txn(txn) {
+
         _finishInit();
     }
        
@@ -191,7 +195,7 @@ namespace mongo {
             _lk.reset(new Lock::DBRead(txn->lockState(), ns));
             Database *db = dbHolder().get(txn, ns);
             if( db ) {
-                _c.reset(new Context(ns, db, doVersion));
+                _c.reset(new Context(txn, ns, db, doVersion));
                 return;
             }
         }
@@ -201,19 +205,23 @@ namespace mongo {
             DEV log() << "_DEBUG ReadContext db wasn't open, will try to open " << ns << endl;
             if (txn->lockState()->isW()) {
                 // write locked already
+                WriteUnitOfWork wunit(txn->recoveryUnit());
                 DEV RARELY log() << "write locked on ReadContext construction " << ns << endl;
-                _c.reset(new Context(ns, doVersion));
+                _c.reset(new Context(txn, ns, doVersion));
+                wunit.commit();
             }
             else if (!txn->lockState()->isRecursive()) {
                 _lk.reset(0);
                 {
                     Lock::GlobalWrite w(txn->lockState());
-                    Context c(ns, doVersion);
+                    WriteUnitOfWork wunit(txn->recoveryUnit());
+                    Context c(txn, ns, doVersion);
+                    wunit.commit();
                 }
 
                 // db could be closed at this interim point -- that is ok, we will throw, and don't mind throwing.
                 _lk.reset(new Lock::DBRead(txn->lockState(), ns));
-                _c.reset(new Context(ns, doVersion));
+                _c.reset(new Context(txn, ns, doVersion));
             }
             else { 
                 uasserted(15928, str::stream() << "can't open a database from a nested read lock " << ns);
@@ -228,9 +236,13 @@ namespace mongo {
     Client::WriteContext::WriteContext(
                 OperationContext* opCtx, const std::string& ns, bool doVersion)
         : _lk(opCtx->lockState(), ns),
-          _c(ns, doVersion) {
+          _wunit(opCtx->recoveryUnit()),
+          _c(opCtx, ns, doVersion) {
     }
 
+    void Client::WriteContext::commit() {
+        _wunit.commit();
+    }
 
     void Client::Context::checkNotStale() const { 
         switch ( _client->_curOp->getOp() ) {
@@ -252,21 +264,24 @@ namespace mongo {
     }
 
     // invoked from ReadContext
-    Client::Context::Context(const string& ns, Database *db, bool doVersion) :
-        _client( currentClient.get() ), 
-        _justCreated(false),
-        _doVersion( doVersion ),
-        _ns( ns ), 
-        _db(db)
-    {
+    Client::Context::Context(OperationContext* txn,
+                             const string& ns,
+                             Database *db,
+                             bool doVersion)
+        : _client( currentClient.get() ), 
+          _justCreated(false),
+          _doVersion( doVersion ),
+          _ns( ns ), 
+          _db(db),
+          _txn(txn) {
+
         verify(_db);
         if (_doVersion) checkNotStale();
         _client->_curOp->enter( this );
     }
        
     void Client::Context::_finishInit() {
-        OperationContextImpl txn; // TODO get rid of this once reads require transactions
-        _db = dbHolder().getOrCreate(&txn, _ns, _justCreated);
+        _db = dbHolder().getOrCreate(_txn, _ns, _justCreated);
         invariant(_db);
 
         if( _doVersion ) checkNotStale();
@@ -276,7 +291,11 @@ namespace mongo {
     
     Client::Context::~Context() {
         DEV verify( _client == currentClient.get() );
-        _client->_curOp->recordGlobalTime( _timer.micros() );
+
+        // Lock must still be held
+        invariant(_txn->lockState()->isLocked());
+
+        _client->_curOp->recordGlobalTime(_txn->lockState()->isWriteLocked(), _timer.micros());
     }
 
     void Client::appendLastOp( BSONObjBuilder& b ) const {
@@ -293,47 +312,25 @@ namespace mongo {
         return "";
     }
 
-    string Client::toString() const {
-        stringstream ss;
-        if ( _curOp )
-            ss << _curOp->info().jsonString();
-        return ss.str();
-    }
-
-    string sayClientState() {
-        Client* c = currentClient.get();
-        if ( !c )
-            return "no client";
-        return c->toString();
-    }
-
     bool Client::gotHandshake( const BSONObj& o ) {
         BSONObjIterator i(o);
 
         {
             BSONElement id = i.next();
             verify( id.type() );
-            _remoteId = id.wrap( "_id" );
+            _remoteId = id.OID();
         }
 
         BSONObjBuilder b;
-        while ( i.more() )
-            b.append( i.next() );
+        while (i.more()) {
+            b.append(i.next());
+        }
         
-        b.appendElementsUnique( _handshake );
-
-        _handshake = b.obj();
-
-        if (repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
-                repl::ReplicationCoordinator::modeReplSet || !o.hasField("member")) {
-            return false;
+        if (!o.hasField("config")) {
+            b.append("config", BSON("host" << clientAddress(true) << "upgradeNeeded" << true));
         }
 
-        return repl::theReplSet->registerSlave(_remoteId, o["member"].Int());
-    }
-
-    bool ClientBasic::hasCurrent() {
-        return currentClient.get();
+        return repl::getGlobalReplicationCoordinator()->processHandshake(_remoteId, b.obj());
     }
 
     ClientBasic* ClientBasic::getCurrent() {
@@ -362,57 +359,7 @@ namespace mongo {
 
     } handshakeCmd;
 
-    int Client::recommendedYieldMicros( int * writers , int * readers, bool needExact ) {
-        int num = 0;
-        int w = 0;
-        int r = 0;
-        {
-            scoped_lock bl(clientsMutex);
-            for ( set<Client*>::iterator i=clients.begin(); i!=clients.end(); ++i ) {
-                Client* c = *i;
-                if ( c->lockState().hasLockPending() ) {
-                    num++;
-                    if ( c->lockState().isWriteLocked() )
-                        w++;
-                    else
-                        r++;
-                }
-                if (num > 100 && !needExact)
-                    break;
-            }
-        }
 
-        if ( writers )
-            *writers = w;
-        if ( readers )
-            *readers = r;
-
-        int time = r * 10; // we have to be nice to readers since they don't have priority
-        time += w; // writers are greedy, so we can be mean tot hem
-
-        time = min( time , 1000000 );
-
-        return time;
-    }
-
-    int Client::getActiveClientCount( int& writers, int& readers ) {
-        writers = 0;
-        readers = 0;
-
-        scoped_lock bl(clientsMutex);
-        for ( set<Client*>::iterator i=clients.begin(); i!=clients.end(); ++i ) {
-            Client* c = *i;
-            if ( ! c->curop()->active() )
-                continue;
-
-            if ( c->lockState().isWriteLocked() )
-                writers++;
-            if ( c->lockState().hasAnyReadLock() )
-                readers++;
-        }
-
-        return writers + readers;
-    }
 
     void OpDebug::reset() {
         extra.reset();

@@ -1,6 +1,6 @@
 /* @file rs_rollback.cpp
 *
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -27,7 +27,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/auth/authorization_manager.h"
 #include "mongo/db/auth/authorization_manager_global.h"
@@ -40,8 +40,10 @@
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 /* Scenarios
  *
@@ -82,11 +84,12 @@
  */
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     using namespace bson;
-
-    void incRBID();
 
     class RSFatalException : public std::exception {
     public:
@@ -231,10 +234,11 @@ namespace repl {
     int getRBID(DBClientConnection*);
 
     static void syncRollbackFindCommonPoint(OperationContext* txn, DBClientConnection* them, FixUpInfo& fixUpInfo) {
-        Client::Context ctx(rsoplog);
+        Client::Context ctx(txn, rsoplog);
 
         boost::scoped_ptr<Runner> runner(
-                InternalPlanner::collectionScan(rsoplog,
+                InternalPlanner::collectionScan(txn,
+                                                rsoplog,
                                                 ctx.db()->getCollection(txn, rsoplog),
                                                 InternalPlanner::BACKWARD));
 
@@ -353,7 +357,7 @@ namespace repl {
         // cloner owns _conn in auto_ptr
         cloner.setConnection(tmpConn);
         uassert(15908, errmsg,
-                tmpConn->connect(host, errmsg) && repl::replAuthenticate(tmpConn));
+                tmpConn->connect(HostAndPort(host), errmsg) && repl::replAuthenticate(tmpConn));
 
         return cloner.copyCollection(txn, ns, BSONObj(), errmsg, true, false, true, false);
     }
@@ -500,13 +504,13 @@ namespace repl {
         for (set<string>::iterator it = fixUpInfo.toDrop.begin();
                 it != fixUpInfo.toDrop.end();
                 it++) {
-            Client::Context ctx(*it);
+            Client::Context ctx(txn, *it);
             log() << "replSet rollback drop: " << *it << rsLog;
             ctx.db()->dropCollection(txn, *it);
         }
 
         sethbmsg("rollback 4.7");
-        Client::Context ctx(rsoplog);
+        Client::Context ctx(txn, rsoplog);
         Collection* oplogCollection = ctx.db()->getCollection(txn, rsoplog);
         uassert(13423,
                 str::stream() << "replSet error in rollback can't find " << rsoplog,
@@ -544,7 +548,7 @@ namespace repl {
                     removeSaver.reset(new Helpers::RemoveSaver("rollback", "", doc.ns));
 
                 // todo: lots of overhead in context, this can be faster
-                Client::Context ctx(doc.ns);
+                Client::Context ctx(txn, doc.ns);
 
                 // Add the doc to our rollback file
                 BSONObj obj;
@@ -752,7 +756,7 @@ namespace repl {
 
         sethbmsg("replSet rollback 3 fixup");
 
-        incRBID();
+        getGlobalReplicationCoordinator()->incrementRollbackID();
         try {
             syncFixUp(txn, how, oplogreader);
         }
@@ -763,10 +767,10 @@ namespace repl {
             return 2;
         }
         catch (...) {
-            incRBID();
+            getGlobalReplicationCoordinator()->incrementRollbackID();
             throw;
         }
-        incRBID();
+        getGlobalReplicationCoordinator()->incrementRollbackID();
 
         // success - leave "ROLLBACK" state
         // can go to SECONDARY once minvalid is achieved

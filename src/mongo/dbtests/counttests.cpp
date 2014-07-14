@@ -32,7 +32,7 @@
 
 #include "mongo/db/db.h"
 #include "mongo/db/json.h"
-#include "mongo/db/ops/count.h"
+#include "mongo/db/commands/count.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/operation_context_impl.h"
 
@@ -42,7 +42,7 @@ namespace CountTests {
 
     class Base {
     public:
-        Base() : lk(_txn.lockState(), ns()), _context( ns() ) {
+        Base() : lk(_txn.lockState(), ns()), _wunit(_txn.recoveryUnit()), _context(&_txn, ns()) {
             _database = _context.db();
             _collection = _database->getCollection( &_txn, ns() );
             if ( _collection ) {
@@ -55,6 +55,7 @@ namespace CountTests {
         ~Base() {
             try {
                 uassertStatusOK( _database->dropCollection( &_txn, ns() ) );
+                _wunit.commit();
             }
             catch ( ... ) {
                 FAIL( "Exception while cleaning up collection" );
@@ -97,6 +98,7 @@ namespace CountTests {
 
     private:
         Lock::DBWrite lk;
+        WriteUnitOfWork _wunit;
 
         Client::Context _context;
 

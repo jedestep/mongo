@@ -31,7 +31,7 @@
 #include "mongo/db/query/explain.h"
 
 #include "mongo/db/exec/multi_plan.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/plan_executor.h"
 #include "mongo/db/query/query_planner.h"
 #include "mongo/db/query/stage_builder.h"
@@ -42,6 +42,150 @@
 #include "mongo/util/processinfo.h"
 #include "mongo/util/version.h"
 
+namespace {
+
+    using namespace mongo;
+
+    /**
+     * Traverse the tree rooted at 'root', and add all tree nodes into the list 'flattened'.
+     */
+    void flattenStatsTree(PlanStageStats* root, vector<PlanStageStats*>* flattened) {
+        flattened->push_back(root);
+        for (size_t i = 0; i < root->children.size(); ++i) {
+            flattenStatsTree(root->children[i], flattened);
+        }
+    }
+
+    /**
+     * Traverse the tree rooted at 'root', and add all nodes into the list 'flattened'.
+     */
+    void flattenExecTree(PlanStage* root, vector<PlanStage*>* flattened) {
+        flattened->push_back(root);
+        vector<PlanStage*> children = root->getChildren();
+        for (size_t i = 0; i < children.size(); ++i) {
+            flattenExecTree(children[i], flattened);
+        }
+    }
+
+    /**
+     * Get a pointer to the MultiPlanStage inside the stage tree rooted at 'root'.
+     * Returns NULL if there is no MPS.
+     */
+    MultiPlanStage* getMultiPlanStage(PlanStage* root) {
+        if (root->stageType() == STAGE_MULTI_PLAN) {
+            MultiPlanStage* mps = static_cast<MultiPlanStage*>(root);
+            return mps;
+        }
+
+        vector<PlanStage*> children = root->getChildren();
+        for (size_t i = 0; i < children.size(); i++) {
+            MultiPlanStage* mps = getMultiPlanStage(children[i]);
+            if (mps != NULL) {
+                return mps;
+            }
+        }
+
+        return NULL;
+    }
+
+    /**
+     * Given the SpecificStats object for a stage and the type of the stage, returns the
+     * number of index keys examined by the stage.
+     *
+     * This is used for getting the total number of keys examined by a plan. We need
+     * to collect a 'totalKeysExamined' metric for a regular explain (in which case this
+     * gets called from Explain::generateExecStats()) or for the slow query log / profiler
+     * (in which case this gets called from Explain::getSummaryStats()).
+     */
+     size_t getKeysExamined(StageType type, const SpecificStats* specific) {
+        if (STAGE_IXSCAN == type) {
+            const IndexScanStats* spec = static_cast<const IndexScanStats*>(specific);
+            return spec->keysExamined;
+        }
+        else if (STAGE_IDHACK == type) {
+            const IDHackStats* spec = static_cast<const IDHackStats*>(specific);
+            return spec->keysExamined;
+        }
+        else if (STAGE_TEXT == type) {
+            const TextStats* spec = static_cast<const TextStats*>(specific);
+            return spec->keysExamined;
+        }
+        else if (STAGE_COUNT == type) {
+            const CountStats* spec = static_cast<const CountStats*>(specific);
+            return spec->keysExamined;
+        }
+
+        return 0;
+     }
+
+    /**
+     * Given the SpecificStats object for a stage and the type of the stage, returns the
+     * number of documents examined by the stage.
+     *
+     * This is used for getting the total number of documents examined by a plan. We need
+     * to collect a 'totalDocsExamined' metric for a regular explain (in which case this
+     * gets called from Explain::generateExecStats()) or for the slow query log / profiler
+     * (in which case this gets called from Explain::getSummaryStats()).
+     */
+    size_t getDocsExamined(StageType type, const SpecificStats* specific) {
+        if (STAGE_IDHACK == type) {
+            const IDHackStats* spec = static_cast<const IDHackStats*>(specific);
+            return spec->docsExamined;
+        }
+        else if (STAGE_TEXT == type) {
+            const TextStats* spec = static_cast<const TextStats*>(specific);
+            return spec->fetches;
+        }
+        else if (STAGE_FETCH == type) {
+            const FetchStats* spec = static_cast<const FetchStats*>(specific);
+            return spec->docsExamined;
+        }
+        else if (STAGE_COLLSCAN == type) {
+            const CollectionScanStats* spec = static_cast<const CollectionScanStats*>(specific);
+            return spec->docsTested;
+        }
+
+        return 0;
+    }
+
+    /**
+     * Adds to the plan summary string being built by 'ss' for the execution stage 'stage'.
+     */
+    void addStageSummaryStr(PlanStage* stage, mongoutils::str::stream& ss) {
+        // First add the stage type string.
+        const CommonStats* common = stage->getCommonStats();
+        ss << common->stageTypeStr;
+
+        // Some leaf nodes also provide info about the index they used.
+        const SpecificStats* specific = stage->getSpecificStats();
+        if (STAGE_COUNT == stage->stageType()) {
+            const CountStats* spec = static_cast<const CountStats*>(specific);
+            ss << " " << spec->keyPattern;
+        }
+        else if (STAGE_DISTINCT == stage->stageType()) {
+            const DistinctScanStats* spec = static_cast<const DistinctScanStats*>(specific);
+            ss << " " << spec->keyPattern;
+        }
+        else if (STAGE_GEO_NEAR_2D == stage->stageType()) {
+            const NearStats* spec = static_cast<const NearStats*>(specific);
+            ss << " " << spec->keyPattern;
+        }
+        else if (STAGE_GEO_NEAR_2DSPHERE == stage->stageType()) {
+            const NearStats* spec = static_cast<const NearStats*>(specific);
+            ss << " " << spec->keyPattern;
+        }
+        else if (STAGE_IXSCAN == stage->stageType()) {
+            const IndexScanStats* spec = static_cast<const IndexScanStats*>(specific);
+            ss << " " << spec->keyPattern;
+        }
+        else if (STAGE_TEXT == stage->stageType()) {
+            const TextStats* spec = static_cast<const TextStats*>(specific);
+            ss << " " << spec->indexPrefix;
+        }
+    }
+
+} // namespace
+
 namespace mongo {
 
     using mongoutils::str::stream;
@@ -49,49 +193,88 @@ namespace mongo {
     MONGO_EXPORT_SERVER_PARAMETER(enableNewExplain, bool, false);
 
     // static
-    void Explain::explainTree(const PlanStageStats& stats,
-                              Explain::Verbosity verbosity,
-                              BSONObjBuilder* bob) {
+    void Explain::explainStatsTree(const PlanStageStats& stats,
+                                   Explain::Verbosity verbosity,
+                                   BSONObjBuilder* bob) {
         invariant(bob);
 
         // Stage name.
         bob->append("stage", stats.common.stageTypeStr);
 
+        // Display the BSON representation of the filter, if there is one.
         if (!stats.common.filter.isEmpty()) {
             bob->append("filter", stats.common.filter);
+        }
+
+        // Some top-level exec stats get pulled out of the root stage.
+        if (verbosity >= Explain::EXEC_STATS) {
+            bob->appendNumber("nReturned", stats.common.advanced);
+            bob->appendNumber("executionTimeMillis", stats.common.executionTimeMillis);
         }
 
         // Stage-specific stats
         if (STAGE_IXSCAN == stats.stageType) {
             IndexScanStats* spec = static_cast<IndexScanStats*>(stats.specific.get());
+
+            if (verbosity >= Explain::EXEC_STATS) {
+                bob->appendNumber("keysExamined", spec->keysExamined);
+            }
+
             bob->append("keyPattern", spec->keyPattern);
             bob->appendBool("isMultiKey", spec->isMultiKey);
             bob->append("indexBounds", spec->indexBounds);
         }
-        else if (STAGE_GEO_NEAR_2D == stats.stageType) {
-            TwoDNearStats* spec = static_cast<TwoDNearStats*>(stats.specific.get());
-            bob->append("keyPattern", spec->keyPattern);
+        else if (STAGE_COLLSCAN == stats.stageType) {
+            CollectionScanStats* spec = static_cast<CollectionScanStats*>(stats.specific.get());
+            if (verbosity >= Explain::EXEC_STATS) {
+                bob->appendNumber("docsExamined", spec->docsTested);
+            }
+        }
+        else if (STAGE_COUNT == stats.stageType) {
+            CountStats* spec = static_cast<CountStats*>(stats.specific.get());
 
-            // TODO these things are execution stats
-            /*bob->appendNumber("keysExamined", spec->nscanned);
-            bob->appendNumber("objectsLoaded", spec->objectsLoaded);*/
+            if (verbosity >= Explain::EXEC_STATS) {
+                bob->appendNumber("keysExamined", spec->keysExamined);
+            }
+
+            bob->append("keyPattern", spec->keyPattern);
+            bob->appendBool("isMultiKey", spec->isMultiKey);
+        }
+        else if (STAGE_FETCH == stats.stageType) {
+            FetchStats* spec = static_cast<FetchStats*>(stats.specific.get());
+            if (verbosity >= Explain::EXEC_STATS) {
+                bob->appendNumber("docsExamined", spec->docsExamined);
+            }
+        }
+        else if (STAGE_IDHACK == stats.stageType) {
+            IDHackStats* spec = static_cast<IDHackStats*>(stats.specific.get());
+            if (verbosity >= Explain::EXEC_STATS) {
+                bob->appendNumber("keysExamined", spec->keysExamined);
+                bob->appendNumber("docsExamined", spec->docsExamined);
+            }
         }
         else if (STAGE_TEXT == stats.stageType) {
             TextStats* spec = static_cast<TextStats*>(stats.specific.get());
+
+            if (verbosity >= Explain::EXEC_STATS) {
+                bob->appendNumber("keysExamined", spec->keysExamined);
+                bob->appendNumber("docsExamined", spec->fetches);
+            }
+
             bob->append("indexPrefix", spec->indexPrefix);
             bob->append("parsedTextQuery", spec->parsedTextQuery);
-
-            // TODO these things are execution stats
-            /*bob->appendNumber("keysExamined", spec->keysExamined);
-            bob->appendNumber("fetches", spec->fetches);*/
         }
         else if (STAGE_SORT == stats.stageType) {
             SortStats* spec = static_cast<SortStats*>(stats.specific.get());
             bob->append("sortPattern", spec->sortPattern);
+
+            if (verbosity >= Explain::EXEC_STATS) {
+                bob->appendNumber("memUsage", spec->memUsage);
+            }
+
             if (spec->limit > 0) {
                 bob->appendNumber("limitAmount", spec->limit);
             }
-            bob->appendNumber("memUsage", spec->memUsage);
         }
         else if (STAGE_SORT_MERGE == stats.stageType) {
             MergeSortStats* spec = static_cast<MergeSortStats*>(stats.specific.get());
@@ -120,18 +303,18 @@ namespace mongo {
         // rather than 'inputStages'.
         if (1 == stats.children.size()) {
             BSONObjBuilder childBob;
-            explainTree(*stats.children[0], verbosity, &childBob);
+            explainStatsTree(*stats.children[0], verbosity, &childBob);
             bob->append("inputStage", childBob.obj());
             return;
         }
 
-        // There is more than one child. Recursively explainTree(...) on each
+        // There is more than one child. Recursively explainStatsTree(...) on each
         // of them and add them to the 'inputStages' array.
 
         BSONArrayBuilder childrenBob(bob->subarrayStart("inputStages"));
         for (size_t i = 0; i < stats.children.size(); ++i) {
             BSONObjBuilder childBob(childrenBob.subobjStart());
-            explainTree(*stats.children[i], verbosity, &childBob);
+            explainStatsTree(*stats.children[i], verbosity, &childBob);
         }
         childrenBob.doneFast();
     }
@@ -139,29 +322,66 @@ namespace mongo {
     // static
     void Explain::generatePlannerInfo(CanonicalQuery* query,
                                       PlanStageStats* winnerStats,
-                                      vector<PlanStageStats*>& rejectedStats,
+                                      const vector<PlanStageStats*>& rejectedStats,
                                       BSONObjBuilder* out) {
         BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));;
 
         plannerBob.append("plannerVersion", QueryPlanner::kPlannerVersion);
 
-        BSONObjBuilder parsedQueryBob(plannerBob.subobjStart("parsedQuery"));
-        query->root()->toBSON(&parsedQueryBob);
-        parsedQueryBob.doneFast();
+        // In general we should have a canonical query, but sometimes we may avoid
+        // creating a canonical query as an optimization (specifically, the update system
+        // does not canonicalize for idhack updates). In these cases, 'query' is NULL.
+        if (NULL != query) {
+            BSONObjBuilder parsedQueryBob(plannerBob.subobjStart("parsedQuery"));
+            query->root()->toBSON(&parsedQueryBob);
+            parsedQueryBob.doneFast();
+        }
 
         BSONObjBuilder winningPlanBob(plannerBob.subobjStart("winningPlan"));
-        explainTree(*winnerStats, Explain::QUERY_PLANNER, &winningPlanBob);
+        explainStatsTree(*winnerStats, Explain::QUERY_PLANNER, &winningPlanBob);
         winningPlanBob.doneFast();
 
         // Genenerate array of rejected plans.
         BSONArrayBuilder allPlansBob(plannerBob.subarrayStart("rejectedPlans"));
         for (size_t i = 0; i < rejectedStats.size(); i++) {
             BSONObjBuilder childBob(allPlansBob.subobjStart());
-            explainTree(*rejectedStats.at(i), Explain::QUERY_PLANNER, &childBob);
+            explainStatsTree(*rejectedStats[i], Explain::QUERY_PLANNER, &childBob);
         }
         allPlansBob.doneFast();
 
         plannerBob.doneFast();
+    }
+
+    // static
+    void Explain::generateExecStats(PlanStageStats* stats,
+                                    BSONObjBuilder* out) {
+
+        out->appendNumber("nReturned", stats->common.advanced);
+        out->appendNumber("executionTimeMillis", stats->common.executionTimeMillis);
+
+        // Flatten the stats tree into a list.
+        vector<PlanStageStats*> statsNodes;
+        flattenStatsTree(stats, &statsNodes);
+
+        // Iterate over all stages in the tree and get the total number of keys/docs examined.
+        // These are just aggregations of information already available in the stats tree.
+        size_t totalKeysExamined = 0;
+        size_t totalDocsExamined = 0;
+        for (size_t i = 0; i < statsNodes.size(); ++i) {
+            
+            totalKeysExamined += getKeysExamined(statsNodes[i]->stageType,
+                                                 statsNodes[i]->specific.get());
+            totalDocsExamined += getDocsExamined(statsNodes[i]->stageType,
+                                                 statsNodes[i]->specific.get());
+        }
+
+        out->appendNumber("totalKeysExamined", totalKeysExamined);
+        out->appendNumber("totalDocsExamined", totalDocsExamined);
+
+        // Add the tree of stages, with individual execution stats for each stage.
+        BSONObjBuilder stagesBob(out->subobjStart("executionStages"));
+        explainStatsTree(*stats, Explain::EXEC_STATS, &stagesBob);
+        stagesBob.doneFast();
     }
 
     // static
@@ -183,124 +403,12 @@ namespace mongo {
     }
 
     // static
-    Status Explain::explainSinglePlan(Collection* collection,
-                                      CanonicalQuery* rawCanonicalQuery,
-                                      QuerySolution* solution,
-                                      Explain::Verbosity verbosity,
-                                      BSONObjBuilder* out) {
-        // Only one possible plan. Build the stages from the solution.
-        WorkingSet* ws = new WorkingSet();
-        PlanStage* root;
-        verify(StageBuilder::build(collection, *solution, ws, &root));
-
-        // Wrap the exec stages in a plan executor. Takes ownership of 'ws' and 'root'.
-        scoped_ptr<PlanExecutor> exec(new PlanExecutor(ws, root, collection));
-
-        // If we need execution stats, then we should run the plan.
-        if (verbosity > Explain::QUERY_PLANNER) {
-            Runner::RunnerState state;
-            BSONObj obj;
-            while (Runner::RUNNER_ADVANCED == (state = exec->getNext(&obj, NULL)));
-
-            if (Runner::RUNNER_ERROR == state) {
-                return Status(ErrorCodes::BadValue,
-                              "Exec error: " + WorkingSetCommon::toStatusString(obj));
-            }
-        }
-
-        scoped_ptr<PlanStageStats> stats(exec->getStats());
-
-        // Actually generate the explain results.
-
-        if (verbosity >= Explain::QUERY_PLANNER) {
-            vector<PlanStageStats*> rejected;
-            generatePlannerInfo(rawCanonicalQuery, stats.get(), rejected, out);
-            generateServerInfo(out);
-        }
-
-        if (verbosity >= Explain::EXEC_STATS) {
-            // TODO: generate executionStats section
-        }
-
-        if (verbosity >= Explain::EXEC_ALL_PLANS) {
-            // TODO: generate rejected plans execution stats
-        }
-
-        return Status::OK();
-    }
-
-    // static
-    Status Explain::explainMultiPlan(Collection* collection,
-                                     CanonicalQuery* rawCanonicalQuery,
-                                     vector<QuerySolution*>& solutions,
-                                     Explain::Verbosity verbosity,
-                                     BSONObjBuilder* out) {
-        scoped_ptr<WorkingSet> sharedWorkingSet(new WorkingSet());
-
-        scoped_ptr<MultiPlanStage> multiPlanStage(
-            new MultiPlanStage(collection, rawCanonicalQuery));
-
-        for (size_t ix = 0; ix < solutions.size(); ++ix) {
-            // version of StageBuild::build when WorkingSet is shared
-            PlanStage* nextPlanRoot;
-            verify(StageBuilder::build(collection, *solutions[ix],
-                                       sharedWorkingSet.get(), &nextPlanRoot));
-
-            // Takes ownership of the solution and the root PlanStage, but not the working set.
-            multiPlanStage->addPlan(solutions[ix], nextPlanRoot, sharedWorkingSet.get());
-        }
-
-        // Run the plan / do the plan selection as required by the requested verbosity.
-        multiPlanStage->pickBestPlan();
-        if (Explain::EXEC_STATS == verbosity) {
-            Status execStatus = multiPlanStage->executeWinningPlan();
-            if (!execStatus.isOK()) {
-                return execStatus;
-            }
-        }
-        else if (Explain::EXEC_ALL_PLANS == verbosity) {
-            Status execStatus = multiPlanStage->executeAllPlans();
-            if (!execStatus.isOK()) {
-                return execStatus;
-            }
-        }
-
-        // Get stats for the winning plan.
-        scoped_ptr<PlanStageStats> stats(multiPlanStage->getStats());
-
-        // Actually generate the explain results.
-
-        if (verbosity >= Explain::QUERY_PLANNER) {
-            vector<PlanStageStats*>* rejected = multiPlanStage->generateCandidateStats();
-            generatePlannerInfo(rawCanonicalQuery, stats.get(), *rejected, out);
-            generateServerInfo(out);
-        }
-
-        if (verbosity >= Explain::EXEC_STATS) {
-            // TODO: generate executionStats section
-        }
-
-        if (verbosity >= Explain::EXEC_ALL_PLANS) {
-            // TODO: generate rejected plans execution stats
-        }
-
-        return Status::OK();
-    }
-
-    // static
-    void Explain::explainEmptyColl(CanonicalQuery* rawCanonicalQuery,
-                                   BSONObjBuilder* out) {
+    void Explain::explainCountEmptyQuery(BSONObjBuilder* out) {
         BSONObjBuilder plannerBob(out->subobjStart("queryPlanner"));
 
         plannerBob.append("plannerVersion", QueryPlanner::kPlannerVersion);
 
-        BSONObjBuilder parsedQueryBob(plannerBob.subobjStart("parsedQuery"));
-        rawCanonicalQuery->root()->toBSON(&parsedQueryBob);
-        parsedQueryBob.doneFast();
-
-        plannerBob.appendBool("emptyCollection", true);
-
-        plannerBob.append("winningPlan", "EOF");
+        plannerBob.append("winningPlan", "TRIVIAL_COUNT");
 
         // Empty array of rejected plans.
         BSONArrayBuilder allPlansBob(plannerBob.subarrayStart("rejectedPlans"));
@@ -312,45 +420,130 @@ namespace mongo {
     }
 
     // static
-    Status Explain::explain(Collection* collection,
-                            CanonicalQuery* rawCanonicalQuery,
-                            size_t plannerOptions,
-                            Explain::Verbosity verbosity,
-                            BSONObjBuilder* out) {
-        invariant(rawCanonicalQuery);
-        auto_ptr<CanonicalQuery> canonicalQuery(rawCanonicalQuery);
+    Status Explain::explainStages(PlanExecutor* exec,
+                                  Explain::Verbosity verbosity,
+                                  BSONObjBuilder* out) {
+        //
+        // Step 1: run the stages as required by the verbosity level.
+        //
 
-        if (NULL == collection) {
-            explainEmptyColl(rawCanonicalQuery, out);
-            return Status::OK();
-        }
+        // Inspect the tree to see if there is a MultiPlanStage.
+        MultiPlanStage* mps = getMultiPlanStage(exec->getStages());
 
-        QueryPlannerParams plannerParams;
-        plannerParams.options = plannerOptions;
-        fillOutPlannerParams(collection, rawCanonicalQuery, &plannerParams);
-
-        vector<QuerySolution*> solutions;
-        Status status = QueryPlanner::plan(*canonicalQuery, plannerParams, &solutions);
-        if (!status.isOK()) {
-            return Status(ErrorCodes::BadValue,
-                          "error processing explain: " + canonicalQuery->toString() +
-                          " planner returned error: " + status.reason());
+        // The executionStats verbosity level requires that we run the winning plan
+        // until if finishes.
+        if (verbosity >= Explain::EXEC_STATS) {
+            Status s = exec->executePlan();
+            if (!s.isOK()) {
+                return s;
+            }
         }
 
-        // We cannot figure out how to answer the query.  Perhaps it requires an index
-        // we do not have?
-        if (0 == solutions.size()) {
-            stream ss;
-            ss << "error processing explain: " << canonicalQuery->toString()
-               << " No query solutions";
-            return Status(ErrorCodes::BadValue, ss);
+        // The allPlansExecution verbosity level requires that we run all plans to completion,
+        // if there are multiple candidates. If 'mps' is NULL, then there was only one candidate,
+        // and we don't have to worry about gathering stats for rejected plans.
+        if (verbosity == Explain::EXEC_ALL_PLANS && NULL != mps) {
+            Status s = mps->executeAllPlans();
+            if (!s.isOK()) {
+                return s;
+            }
         }
-        else if (1 == solutions.size()) {
-            return explainSinglePlan(collection, rawCanonicalQuery, solutions[0], verbosity, out);
+
+        //
+        // Step 2: collect plan stats (which also give the structure of the plan tree).
+        //
+
+        // Get stats for the winning plan.
+        scoped_ptr<PlanStageStats> winningStats(exec->getStats());
+
+        // Get stats for the rejected plans, if there were rehected plans.
+        vector<PlanStageStats*> rejectedStats;
+        if (NULL != mps) {
+            rejectedStats = mps->generateCandidateStats();
         }
-        else {
-            return explainMultiPlan(collection, rawCanonicalQuery, solutions, verbosity, out);
+
+        //
+        // Step 3: use the stats trees to produce explain BSON.
+        //
+
+        CanonicalQuery* query = exec->getCanonicalQuery();
+        if (verbosity >= Explain::QUERY_PLANNER) {
+            generatePlannerInfo(query, winningStats.get(), rejectedStats, out);
         }
+
+        if (verbosity >= Explain::EXEC_STATS) {
+            BSONObjBuilder execBob(out->subobjStart("executionStats"));
+
+            // Generate exec stats BSON for the winning plan.
+            generateExecStats(winningStats.get(), &execBob);
+
+            // Also generate exec stats for each rejected plan, if the verbosity level
+            // is high enough.
+            if (verbosity >= Explain::EXEC_ALL_PLANS) {
+                BSONArrayBuilder rejectedBob(execBob.subarrayStart("rejectedPlansExecution"));
+                for (size_t i = 0; i < rejectedStats.size(); ++i) {
+                    BSONObjBuilder planBob(rejectedBob.subobjStart());
+                    generateExecStats(rejectedStats[i], &planBob);
+                    planBob.doneFast();
+                }
+                rejectedBob.doneFast();
+            }
+
+            execBob.doneFast();
+        }
+
+        generateServerInfo(out);
+
+        return Status::OK();
+    }
+
+    void Explain::getSummaryStats(PlanExecutor* exec, PlanSummaryStats* statsOut) {
+        invariant(NULL != statsOut);
+
+        PlanStage* root = exec->getStages();
+
+        // We can get some of the fields we need from the common stats stored in the
+        // root stage of the plan tree.
+        const CommonStats* common = root->getCommonStats();
+        statsOut->nReturned = common->advanced;
+        statsOut->executionTimeMillis = common->executionTimeMillis;
+
+        // The other fields are aggregations over the stages in the plan tree. We flatten
+        // the tree into a list and then compute these aggregations.
+        vector<PlanStage*> stages;
+        flattenExecTree(root, &stages);
+
+        // Use this stream to build the plan summary string.
+        mongoutils::str::stream ss;
+        bool seenLeaf = false;
+
+        for (size_t i = 0; i < stages.size(); i++) {
+            statsOut->totalKeysExamined += getKeysExamined(stages[i]->stageType(),
+                                                           stages[i]->getSpecificStats());
+            statsOut->totalDocsExamined += getDocsExamined(stages[i]->stageType(),
+                                                           stages[i]->getSpecificStats());
+
+            if (STAGE_IDHACK == stages[i]->stageType()) {
+                statsOut->isIdhack = true;
+            }
+            if (STAGE_SORT == stages[i]->stageType()) {
+                statsOut->hasSortStage = true;
+            }
+
+            if (stages[i]->getChildren().empty()) {
+                // This is a leaf node. Add to the plan summary string accordingly. Unless
+                // this is the first leaf we've seen, add a delimiting string first.
+                if (seenLeaf) {
+                    ss << ", ";
+                }
+                else {
+                    seenLeaf = true;
+                }
+                addStageSummaryStr(stages[i], ss);
+            }
+        }
+
+        statsOut->summaryStr = ss;
     }
 
 } // namespace mongo

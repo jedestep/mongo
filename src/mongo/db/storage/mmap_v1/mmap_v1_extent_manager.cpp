@@ -37,12 +37,15 @@
 #include "mongo/db/d_concurrency.h"
 #include "mongo/db/storage/mmap_v1/dur.h"
 #include "mongo/db/storage/mmap_v1/data_file.h"
-#include "mongo/db/storage/extent.h"
-#include "mongo/db/storage/extent_manager.h"
-#include "mongo/db/storage/record.h"
+#include "mongo/db/storage/mmap_v1/record.h"
+#include "mongo/db/storage/mmap_v1/extent.h"
+#include "mongo/db/storage/mmap_v1/extent_manager.h"
 #include "mongo/db/operation_context.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kStorage);
 
     MmapV1ExtentManager::MmapV1ExtentManager( const StringData& dbname,
                                   const StringData& path,
@@ -187,8 +190,8 @@ namespace mongo {
         return ret;
     }
 
-    size_t MmapV1ExtentManager::numFiles() const {
-        return _files.size();
+    int MmapV1ExtentManager::numFiles() const {
+        return static_cast<int>( _files.size() );
     }
 
     long long MmapV1ExtentManager::fileSize() const {
@@ -228,7 +231,19 @@ namespace mongo {
         return e;
     }
 
-    void _quotaExceeded() {
+    void _checkQuota( bool enforceQuota, int fileNo ) {
+        if ( !enforceQuota )
+            return;
+
+        if ( fileNo < storageGlobalParams.quotaFiles )
+            return;
+
+        // exceeded!
+        if ( cc().hasWrittenSinceCheckpoint() ) {
+            warning() << "quota exceeded, but can't assert" << endl;
+            return;
+        }
+
         uasserted(12501, "quota exceeded");
     }
 
@@ -240,18 +255,9 @@ namespace mongo {
                                                 int fileNo,
                                                 DataFile* f,
                                                 int size,
-                                                int maxFileNoForQuota ) {
+                                                bool enforceQuota ) {
 
-        size = MmapV1ExtentManager::quantizeExtentSize( size );
-
-        if ( maxFileNoForQuota > 0 && fileNo - 1 >= maxFileNoForQuota ) {
-            if ( cc().hasWrittenSinceCheckpoint() ) {
-                warning() << "quota exceeded, but can't assert" << endl;
-            }
-            else {
-                _quotaExceeded();
-            }
-        }
+        _checkQuota( enforceQuota, fileNo - 1 );
 
         massert( 10358, "bad new extent size", size >= minSize() && size <= maxSize() );
 
@@ -270,8 +276,8 @@ namespace mongo {
 
 
     DiskLoc MmapV1ExtentManager::_createExtent( OperationContext* txn,
-                                          int size,
-                                          int maxFileNoForQuota ) {
+                                                int size,
+                                                bool enforceQuota ) {
         size = quantizeExtentSize( size );
 
         if ( size > maxSize() )
@@ -282,16 +288,11 @@ namespace mongo {
         for ( int i = numFiles() - 1; i >= 0; i-- ) {
             DataFile* f = getFile( txn, i );
             if ( f->getHeader()->unusedLength >= size ) {
-                return _createExtentInFile( txn, i, f, size, maxFileNoForQuota );
+                return _createExtentInFile( txn, i, f, size, enforceQuota );
             }
         }
 
-        if ( maxFileNoForQuota > 0 &&
-             static_cast<int>( numFiles() ) >= maxFileNoForQuota &&
-             !cc().hasWrittenSinceCheckpoint() ) {
-            _quotaExceeded();
-        }
-
+        _checkQuota( enforceQuota, numFiles() );
 
         // no space in an existing file
         // allocate files until we either get one big enough or hit maxSize
@@ -299,7 +300,7 @@ namespace mongo {
             DataFile* f = _addAFile( txn, size, false );
 
             if ( f->getHeader()->unusedLength >= size ) {
-                return _createExtentInFile( txn, numFiles() - 1, f, size, maxFileNoForQuota );
+                return _createExtentInFile( txn, numFiles() - 1, f, size, enforceQuota );
             }
 
         }
@@ -396,13 +397,13 @@ namespace mongo {
     DiskLoc MmapV1ExtentManager::allocateExtent( OperationContext* txn,
                                            bool capped,
                                            int size,
-                                           int quotaMax ) {
+                                           bool enforceQuota ) {
 
         bool fromFreeList = true;
         DiskLoc eloc = _allocFromFreeList( txn, size, capped );
         if ( eloc.isNull() ) {
             fromFreeList = false;
-            eloc = _createExtent( txn, size, quotaMax );
+            eloc = _createExtent( txn, size, enforceQuota );
         }
 
         invariant( !eloc.isNull() );

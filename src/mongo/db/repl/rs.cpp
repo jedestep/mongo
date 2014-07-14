@@ -46,16 +46,11 @@ namespace repl {
     
     using namespace bson;
 
-    bool replSet = false;
     ReplSet *theReplSet = 0;
 
     // This is a bitmask with the first bit set. It's used to mark connections that should be kept
     // open during stepdowns
     const unsigned ScopedConn::keepOpen = 1;
-
-    bool isCurrentlyAReplSetPrimary() {
-        return theReplSet && theReplSet->isPrimary();
-    }
 
     void sethbmsg(const string& s, const int level) {
         if (theReplSet) {
@@ -74,7 +69,6 @@ namespace repl {
 
     ReplSetImpl::StartupStatus ReplSetImpl::startupStatus = PRESTART;
     DiagStr ReplSetImpl::startupStatusMsg;
-    ReplicationStartSynchronizer ReplSetImpl::rss;
 
     void ReplSet::haveNewConfig(ReplSetConfig& newConfig, bool addComment) {
         bo comment;
@@ -124,7 +118,6 @@ namespace repl {
         try {
             verify( theReplSet == 0 );
             if( replSetSeedList == 0 ) {
-                verify(!replSet);
                 return;
             }
             replLocalAuth();

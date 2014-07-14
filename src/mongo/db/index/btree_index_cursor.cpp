@@ -44,7 +44,7 @@ namespace mongo {
     unordered_set<BtreeIndexCursor*> BtreeIndexCursor::_activeCursors;
     SimpleMutex BtreeIndexCursor::_activeCursorsMutex("active_btree_index_cursors");
 
-    BtreeIndexCursor::BtreeIndexCursor(BtreeInterface::Cursor* cursor)
+    BtreeIndexCursor::BtreeIndexCursor(SortedDataInterface::Cursor* cursor)
         : _cursor(cursor) {
 
         SimpleMutex::scoped_lock lock(_activeCursorsMutex);
@@ -124,16 +124,12 @@ namespace mongo {
     }
 
     Status BtreeIndexCursor::savePosition() {
-        if (isEOF()) {
-            return Status(ErrorCodes::IllegalOperation, "Can't save position when EOF");
-        }
-
-        _cursor->savePosition(&_savedData);
+        _cursor->savePosition();
         return Status::OK();
     }
 
     Status BtreeIndexCursor::restorePosition() {
-        _cursor->restorePosition(_savedData);
+        _cursor->restorePosition();
         return Status::OK();
     }
 

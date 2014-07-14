@@ -42,6 +42,12 @@ namespace mongo {
     OperationContextImpl::OperationContextImpl() {
         invariant( globalStorageEngine );
         _recovery.reset(globalStorageEngine->newRecoveryUnit(this));
+
+        getGlobalEnvironment()->registerOperationContext(this);
+    }
+
+    OperationContextImpl::~OperationContextImpl() {
+        getGlobalEnvironment()->unregisterOperationContext(this);
     }
 
     RecoveryUnit* OperationContextImpl::recoveryUnit() const {
@@ -60,8 +66,12 @@ namespace mongo {
         return &getCurOp()->setMessage(msg, name, progressMeterTotal, secondsBetween);
     }
 
-    const char* OperationContextImpl::getNS() const {
+    string OperationContextImpl::getNS() const {
         return getCurOp()->getNS();
+    }
+
+    Client* OperationContextImpl::getClient() const {
+        return &cc();
     }
 
     CurOp* OperationContextImpl::getCurOp() const {
@@ -172,6 +182,10 @@ namespace mongo {
     bool OperationContextImpl::isPrimaryFor( const StringData& ns ) {
         return repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
                 NamespaceString(ns).db());
+    }
+
+    Transaction* OperationContextImpl::getTransaction() {
+        return _tx.setTxIdOnce((unsigned)getCurOp()->opNum());
     }
 
 }  // namespace mongo

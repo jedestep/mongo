@@ -35,10 +35,11 @@
 #include "mongo/base/string_data.h"
 #include "mongo/db/storage/recovery_unit.h"
 #include "mongo/db/lockstate.h"
+#include "mongo/db/concurrency/lock_mgr.h"
 
 
 namespace mongo {
-
+    class Client;
     class CurOp;
     class ProgressMeter;
 
@@ -90,13 +91,16 @@ namespace mongo {
                                           int secondsBetween = 3) = 0;
 
         /**
-         * Delegates to CurOp, but is included here to break dependencies
+         * Delegates to CurOp, but is included here to break dependencies.
+         *
+         * TODO: We return a string because of hopefully transient CurOp thread-unsafe insanity.
          */
-        virtual const char * getNS() const = 0;
+        virtual string getNS() const = 0;
 
-        //
-        // CurOp
-        //
+        /**
+         * Returns the client under which this context runs.
+         */
+        virtual Client* getClient() const = 0;
 
         /**
          * Returns CurOp. Caller does not own pointer
@@ -107,6 +111,11 @@ namespace mongo {
          * @return true if this instance is primary for this namespace
          */
         virtual bool isPrimaryFor( const StringData& ns ) = 0;
+
+        /**
+         * @return Transaction* for LockManager-ment.  Caller does not own pointer
+         */
+        virtual Transaction* getTransaction() = 0;
 
     protected:
         OperationContext() { }

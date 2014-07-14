@@ -30,19 +30,51 @@
 
 #include "mongo/db/repl/repl_coordinator_impl.h"
 
+#include <algorithm>
 #include <boost/thread.hpp>
 
 #include "mongo/base/status.h"
+#include "mongo/db/server_options.h"
 #include "mongo/db/repl/repl_settings.h"
 #include "mongo/db/repl/replication_executor.h"
 #include "mongo/db/repl/rs.h"
+#include "mongo/db/write_concern_options.h"
 #include "mongo/stdx/functional.h"
 #include "mongo/util/assert_util.h"
+#include "mongo/util/time_support.h"
+#include "mongo/util/timer.h"
 
 namespace mongo {
 namespace repl {
 
-    ReplicationCoordinatorImpl::ReplicationCoordinatorImpl() {}
+    struct ReplicationCoordinatorImpl::WaiterInfo {
+
+        /**
+         * Constructor takes the list of waiters and enqueues itself on the list, removing itself
+         * in the destructor.
+         */
+        WaiterInfo(std::vector<WaiterInfo*>* _list,
+                   const OpTime* _opTime,
+                   const WriteConcernOptions* _writeConcern,
+                   boost::condition_variable* _condVar) : list(_list),
+                                                          opTime(_opTime),
+                                                          writeConcern(_writeConcern),
+                                                          condVar(_condVar) {
+            list->push_back(this);
+        }
+
+        ~WaiterInfo() {
+            list->erase(std::remove(list->begin(), list->end(), this), list->end());
+        }
+
+        std::vector<WaiterInfo*>* list;
+        const OpTime* opTime;
+        const WriteConcernOptions* writeConcern;
+        boost::condition_variable* condVar;
+    };
+
+    ReplicationCoordinatorImpl::ReplicationCoordinatorImpl(const ReplSettings& settings) :
+            _inShutdown(false), _settings(settings) {}
 
     ReplicationCoordinatorImpl::~ReplicationCoordinatorImpl() {}
 
@@ -69,12 +101,28 @@ namespace repl {
     }
 
     void ReplicationCoordinatorImpl::shutdown() {
+        // Shutdown must:
+        // * prevent new threads from blocking in awaitReplication
+        // * wake up all existing threads blocking in awaitReplication
+        // * tell the ReplicationExecutor to shut down
+        // * wait for the thread running the ReplicationExecutor to finish
+
         if (!isReplEnabled()) {
             return;
         }
 
+        {
+            boost::lock_guard<boost::mutex> lk(_mutex);
+            _inShutdown = true;
+            for (std::vector<WaiterInfo*>::iterator it = _replicationWaiterList.begin();
+                    it != _replicationWaiterList.end(); ++it) {
+                WaiterInfo* waiter = *it;
+                waiter->condVar->notify_all();
+            }
+        }
+
         _replExecutor->shutdown();
-        _topCoordDriverThread->join();
+        _topCoordDriverThread->join(); // must happen outside _mutex
     }
 
     bool ReplicationCoordinatorImpl::isShutdownOkay() const {
@@ -82,11 +130,14 @@ namespace repl {
         return false;
     }
 
+    ReplSettings& ReplicationCoordinatorImpl::getSettings() {
+        return _settings;
+    }
+
     ReplicationCoordinator::Mode ReplicationCoordinatorImpl::getReplicationMode() const {
-        // TODO(spencer): Don't rely on global replSettings object
-        if (replSettings.usingReplSets()) {
+        if (_settings.usingReplSets()) {
             return modeReplSet;
-        } else if (replSettings.slave || replSettings.master) {
+        } else if (_settings.slave || _settings.master) {
             return modeMasterSlave;
         }
         return modeNone;
@@ -104,12 +155,108 @@ namespace repl {
         return _currentState;
     }
 
+    Status ReplicationCoordinatorImpl::setLastOptime(const OID& rid,
+                                                     const OpTime& ts) {
+        // TODO(spencer): update slave tracking thread for local.slaves
+        // TODO(spencer): pass info upstream if we're not primary
+        boost::lock_guard<boost::mutex> lk(_mutex);
+
+        OpTime& slaveOpTime = _slaveOpTimeMap[rid];
+        if (slaveOpTime < ts) {
+            slaveOpTime = ts;
+            // TODO(spencer): update write concern tags if we're a replSet
+
+            // Wake up any threads waiting for replication that now have their replication
+            // check satisfied
+            for (std::vector<WaiterInfo*>::iterator it = _replicationWaiterList.begin();
+                    it != _replicationWaiterList.end(); ++it) {
+                WaiterInfo* info = *it;
+                if (_opReplicatedEnough_inlock(*info->opTime, *info->writeConcern)) {
+                    info->condVar->notify_all();
+                }
+            }
+        }
+        return Status::OK();
+    }
+
+
+    bool ReplicationCoordinatorImpl::_opReplicatedEnough_inlock(
+            const OpTime& opId, const WriteConcernOptions& writeConcern) {
+        int numNodes;
+        if (!writeConcern.wMode.empty()) {
+            fassert(18524, writeConcern.wMode == "majority"); // TODO(spencer): handle tags
+            numNodes = _rsConfig.majorityNumber;
+        } else {
+            numNodes = writeConcern.wNumNodes;
+        }
+
+        for (SlaveOpTimeMap::iterator it = _slaveOpTimeMap.begin();
+                it != _slaveOpTimeMap.end(); ++it) {
+            const OpTime& slaveTime = it->second;
+            if (slaveTime >= opId) {
+                --numNodes;
+            }
+            if (numNodes <= 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitReplication(
             const OperationContext* txn,
-            const OpTime& ts,
+            const OpTime& opId,
             const WriteConcernOptions& writeConcern) {
-        // TODO
-        return StatusAndDuration(Status::OK(), Milliseconds(0));
+        // TODO(spencer): handle killop
+
+
+        if (writeConcern.wNumNodes <= 1 && writeConcern.wMode.empty()) {
+            // no desired replication check
+            return StatusAndDuration(Status::OK(), Milliseconds(0));
+        }
+
+        const Mode replMode = getReplicationMode();
+        if (replMode == modeNone || serverGlobalParams.configsvr) {
+            // no replication check needed (validated above)
+            return StatusAndDuration(Status::OK(), Milliseconds(0));
+        }
+
+        if (writeConcern.wMode == "majority" && replMode == modeMasterSlave) {
+            // with master/slave, majority is equivalent to w=1
+            return StatusAndDuration(Status::OK(), Milliseconds(0));
+        }
+
+        Timer timer;
+        boost::condition_variable condVar;
+        boost::unique_lock<boost::mutex> lk(_mutex);
+        // Must hold _mutex before constructing waitInfo as it will modify _replicationWaiterList
+        WaiterInfo waitInfo(&_replicationWaiterList, &opId, &writeConcern, &condVar);
+
+        while (!_opReplicatedEnough_inlock(opId, writeConcern)) {
+            const int elapsed = timer.millis();
+            if (writeConcern.wTimeout != WriteConcernOptions::kNoTimeout &&
+                    elapsed > writeConcern.wTimeout) {
+                return StatusAndDuration(Status(ErrorCodes::ExceededTimeLimit,
+                                                "waiting for replication timed out"),
+                                         Milliseconds(elapsed));
+            }
+
+            if (_inShutdown) {
+                return StatusAndDuration(Status(ErrorCodes::ShutdownInProgress,
+                                                "Replication is being shut down"),
+                                         Milliseconds(elapsed));
+            }
+
+            try {
+                if (writeConcern.wTimeout == WriteConcernOptions::kNoTimeout) {
+                    condVar.wait(lk);
+                } else {
+                    condVar.timed_wait(lk, Milliseconds(writeConcern.wTimeout - elapsed));
+                }
+            } catch (const boost::thread_interrupted&) {}
+        }
+
+        return StatusAndDuration(Status::OK(), Milliseconds(timer.millis()));
     }
 
     ReplicationCoordinator::StatusAndDuration ReplicationCoordinatorImpl::awaitReplicationOfLastOp(
@@ -143,9 +290,9 @@ namespace repl {
         return false;
     }
 
-    bool ReplicationCoordinatorImpl::canServeReadsFor(const NamespaceString& collection) {
+    Status ReplicationCoordinatorImpl::canServeReadsFor(const NamespaceString& ns, bool slaveOk) {
         // TODO
-        return false;
+        return Status::OK();
     }
 
     bool ReplicationCoordinatorImpl::shouldIgnoreUniqueIndex(const IndexDescriptor* idx) {
@@ -177,15 +324,35 @@ namespace repl {
         return true;
     }
 
-    Status ReplicationCoordinatorImpl::setLastOptime(const OID& rid,
-                                                     const OpTime& ts,
-                                                     const BSONObj& config) {
+    OID ReplicationCoordinatorImpl::getElectionId() {
         // TODO
-        return Status::OK();
+        return OID();
     }
 
     void ReplicationCoordinatorImpl::processReplSetGetStatus(BSONObjBuilder* result) {
         // TODO
+    }
+
+    bool ReplicationCoordinatorImpl::setMaintenanceMode(bool activate) {
+        // TODO
+        return false;
+    }
+
+    Status ReplicationCoordinatorImpl::processReplSetSyncFrom(const std::string& target,
+                                                              BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorImpl::processReplSetMaintenance(bool activate,
+                                                                 BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorImpl::processReplSetFreeze(int secs, BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
     }
 
     Status ReplicationCoordinatorImpl::processHeartbeat(const BSONObj& cmdObj, 
@@ -207,6 +374,39 @@ namespace repl {
         return result;
     }
 
+    Status ReplicationCoordinatorImpl::processReplSetReconfig(OperationContext* txn,
+                                                              const ReplSetReconfigArgs& args,
+                                                              BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorImpl::processReplSetInitiate(OperationContext* txn,
+                                                              const BSONObj& configObj,
+                                                              BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorImpl::processReplSetGetRBID(BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    void ReplicationCoordinatorImpl::incrementRollbackID() { /* TODO */ }
+
+    Status ReplicationCoordinatorImpl::processReplSetFresh(const ReplSetFreshArgs& args,
+                                                           BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorImpl::processReplSetElect(const ReplSetElectArgs& args,
+                                                           BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
     void ReplicationCoordinatorImpl::setCurrentReplicaSetConfig(
             const TopologyCoordinator::ReplicaSetConfig& newConfig) {
         invariant(getReplicationMode() == modeReplSet);
@@ -214,5 +414,37 @@ namespace repl {
         _rsConfig = newConfig;
     }
 
+    Status ReplicationCoordinatorImpl::processReplSetUpdatePosition(const BSONArray& updates,
+                                                                    BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    Status ReplicationCoordinatorImpl::processReplSetUpdatePositionHandshake(
+            const BSONObj& handshake,
+            BSONObjBuilder* resultObj) {
+        // TODO
+        return Status::OK();
+    }
+
+    bool ReplicationCoordinatorImpl::processHandshake(const OID& remoteID,
+                                                      const BSONObj& handshake) {
+        // TODO
+        return false;
+    }
+
+    void ReplicationCoordinatorImpl::waitUpToOneSecondForOptimeChange(const OpTime& ot) {
+        //TODO
+    }
+
+    bool ReplicationCoordinatorImpl::buildsIndexes() {
+        // TODO
+        return false;
+    }
+
+    std::vector<BSONObj> ReplicationCoordinatorImpl::getHostsWrittenTo(const OpTime& op) {
+        // TODO
+        return std::vector<BSONObj>();
+    }
 } // namespace repl
 } // namespace mongo

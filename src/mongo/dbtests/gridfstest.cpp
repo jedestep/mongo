@@ -29,6 +29,7 @@
 #include "mongo/pch.h"
 
 #include "mongo/client/gridfs.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/assert_util.h"
 
@@ -41,8 +42,10 @@ namespace {
     class SetChunkSizeTest {
     public:
         virtual void run() {
-            DBDirectClient client;
-            GridFS grid( client, "gridtest" );
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
+            GridFS grid(client, "gridtest");
             grid.setChunkSize( 5 );
 
             ASSERT_EQUALS( 5U, grid.getChunkSize() );

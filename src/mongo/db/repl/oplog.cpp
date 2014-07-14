@@ -1,7 +1,7 @@
 // @file oplog.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -28,7 +28,7 @@
 *    it in the license file.
 */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/repl/oplog.h"
 
@@ -51,7 +51,7 @@
 #include "mongo/db/ops/update_lifecycle_impl.h"
 #include "mongo/db/ops/delete.h"
 #include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/repl_settings.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h"
 #include "mongo/db/repl/write_concern.h"
 #include "mongo/db/stats/counters.h"
@@ -63,9 +63,13 @@
 #include "mongo/scripting/engine.h"
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/file.h"
+#include "mongo/util/log.h"
 #include "mongo/util/startup_test.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     // cached copies of these...so don't rename them, drop them, etc.!!!
@@ -117,13 +121,17 @@ namespace repl {
     void _logOpObjRS(const BSONObj& op) {
         OperationContextImpl txn;
         Lock::DBWrite lk(txn.lockState(), "local");
+        // XXX soon this needs to be part of an outer WUOW not its own.
+        // We can't do this yet due to locking limitations.
+        WriteUnitOfWork wunit(txn.recoveryUnit());
 
         const OpTime ts = op["ts"]._opTime();
         long long h = op["h"].numberLong();
 
         {
             if ( localOplogRSCollection == 0 ) {
-                Client::Context ctx(rsoplog);
+                Client::Context ctx(&txn, rsoplog);
+
                 localDB = ctx.db();
                 verify( localDB );
                 localOplogRSCollection = localDB->getCollection( &txn, rsoplog );
@@ -131,7 +139,7 @@ namespace repl {
                         "local.oplog.rs missing. did you drop it? if so restart server",
                         localOplogRSCollection);
             }
-            Client::Context ctx(rsoplog, localDB);
+            Client::Context ctx(&txn, rsoplog, localDB);
             checkOplogInsert( localOplogRSCollection->insertDocument( &txn, op, false ) );
 
             /* todo: now() has code to handle clock skew.  but if the skew server to server is large it will get unhappy.
@@ -142,11 +150,12 @@ namespace repl {
                     log() << "replication oplog stream went back in time. previous timestamp: "
                           << theReplSet->lastOpTimeWritten << " newest timestamp: " << ts
                           << ". attempting to sync directly from primary." << endl;
-                    std::string errmsg;
                     BSONObjBuilder result;
-                    if (!theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
-                                                   errmsg, result)) {
-                        log() << "Can't sync from primary: " << errmsg << endl;
+                    Status status =
+                            theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
+                                                      &result);
+                    if (!status.isOK()) {
+                        log() << "Can't sync from primary: " << status;
                     }
                 }
                 theReplSet->lastOpTimeWritten = ts;
@@ -158,6 +167,7 @@ namespace repl {
         }
 
         setNewOptime(ts);
+        wunit.commit();
     }
 
     /**
@@ -234,6 +244,7 @@ namespace repl {
                          bool *bb,
                          bool fromMigrate ) {
         Lock::DBWrite lk1(txn->lockState(), "local");
+        WriteUnitOfWork wunit(txn->recoveryUnit());
 
         if ( strncmp(ns, "local.", 6) == 0 ) {
             if ( strncmp(ns, "local.slaves", 12) == 0 )
@@ -282,14 +293,14 @@ namespace repl {
         DEV verify( logNS == 0 ); // check this was never a master/slave master
 
         if ( localOplogRSCollection == 0 ) {
-            Client::Context ctx(rsoplog);
+            Client::Context ctx(txn, rsoplog);
             localDB = ctx.db();
             verify( localDB );
             localOplogRSCollection = localDB->getCollection( txn, rsoplog );
             massert(13347, "local.oplog.rs missing. did you drop it? if so restart server", localOplogRSCollection);
         }
 
-        Client::Context ctx(rsoplog, localDB);
+        Client::Context ctx(txn, rsoplog, localDB);
         OplogDocWriter writer( partial, obj );
         checkOplogInsert( localOplogRSCollection->insertDocument( txn, &writer, false ) );
 
@@ -301,17 +312,18 @@ namespace repl {
                 log() << "replication oplog stream went back in time. previous timestamp: "
                       << theReplSet->lastOpTimeWritten << " newest timestamp: " << ts
                       << ". attempting to sync directly from primary." << endl;
-                std::string errmsg;
                 BSONObjBuilder result;
-                if (!theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
-                                               errmsg, result)) {
-                    log() << "Can't sync from primary: " << errmsg << endl;
+                Status status = theReplSet->forceSyncFrom(theReplSet->box.getPrimary()->fullName(),
+                                                          &result);
+                if (!status.isOK()) {
+                    log() << "Can't sync from primary: " << status;
                 }
             }
             theReplSet->lastOpTimeWritten = ts;
             theReplSet->lastH = hashNew;
             ctx.getClient()->setLastOp( ts );
         }
+        wunit.commit();
 
     }
 
@@ -324,6 +336,7 @@ namespace repl {
                           bool *bb,
                           bool fromMigrate ) {
         Lock::DBWrite lk(txn->lockState(), "local");
+        WriteUnitOfWork wunit(txn->recoveryUnit());
         static BufBuilder bufbuilder(8*1024); // todo there is likely a mutex on this constructor
 
         if ( strncmp(ns, "local.", 6) == 0 ) {
@@ -360,18 +373,19 @@ namespace repl {
         }
 
         if ( localOplogMainCollection == 0 ) {
-            Client::Context ctx(logNS);
+            Client::Context ctx(txn, logNS);
             localDB = ctx.db();
             verify( localDB );
             localOplogMainCollection = localDB->getCollection(txn, logNS);
             verify( localOplogMainCollection );
         }
 
-        Client::Context ctx(logNS , localDB);
+        Client::Context ctx(txn, logNS , localDB);
         OplogDocWriter writer( partial, obj );
         checkOplogInsert( localOplogMainCollection->insertDocument( txn, &writer, false ) );
 
         ctx.getClient()->setLastOp( ts );
+        wunit.commit();
     }
 
     static void (*_logOp)(OperationContext* txn,
@@ -383,11 +397,13 @@ namespace repl {
                           bool *bb,
                           bool fromMigrate ) = _logOpOld;
     void newReplUp() {
-        replSettings.master = true;
+        getGlobalReplicationCoordinator()->getSettings().master = true;
         _logOp = _logOpRS;
     }
     void newRepl() {
-        replSettings.master = true; // TODO(spencer): is this necessary even when a replset?
+        // TODO(spencer): We shouldn't be changing the ReplicationCoordinator's settings after
+        // startup
+        getGlobalReplicationCoordinator()->getSettings().master = true;
         _logOp = _logOpUninitialized;
     }
     void oldRepl() { _logOp = _logOpOld; }
@@ -417,7 +433,7 @@ namespace repl {
                bool* b,
                bool fromMigrate) {
         try {
-            if ( replSettings.master ) {
+            if ( getGlobalReplicationCoordinator()->getSettings().master ) {
                 _logOp(txn, opstr, ns, 0, obj, patt, b, fromMigrate);
             }
 
@@ -449,17 +465,18 @@ namespace repl {
 
         const char * ns = "local.oplog.$main";
 
+        const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         bool rs = !replSettings.replSet.empty();
         if( rs )
             ns = rsoplog;
 
-        Client::Context ctx(ns);
+        Client::Context ctx(&txn, ns);
         Collection* collection = ctx.db()->getCollection( &txn, ns );
 
         if ( collection ) {
 
             if (replSettings.oplogSize != 0) {
-                int o = (int)(collection->getRecordStore()->storageSize() / ( 1024 * 1024 ) );
+                int o = (int)(collection->getRecordStore()->storageSize(&txn) / ( 1024 * 1024 ) );
                 int n = (int)(replSettings.oplogSize / (1024 * 1024));
                 if ( n != o ) {
                     stringstream ss;
@@ -510,9 +527,11 @@ namespace repl {
         options.cappedSize = sz;
         options.autoIndexId = CollectionOptions::NO;
 
+        WriteUnitOfWork wunit(txn.recoveryUnit());
         invariant( ctx.db()->createCollection( &txn, ns, options ) );
         if( !rs )
             logOp( &txn, "n", "", BSONObj() );
+        wunit.commit();
 
         /* sync here so we don't get any surprising lag later when we try to sync */
         globalStorageEngine->flushAllFiles(true);
@@ -766,17 +785,14 @@ namespace repl {
         return failedUpdate;
     }
 
-    bool waitForOptimeChange(const OpTime& referenceTime, unsigned timeoutMillis) {
+    void waitUpToOneSecondForOptimeChange(const OpTime& referenceTime) {
         mutex::scoped_lock lk(newOpMutex);
 
         while (referenceTime == getLastSetOptime()) {
             if (!newOptimeNotifier.timed_wait(lk.boost(),
-                                              boost::posix_time::milliseconds(timeoutMillis)))
-                return false;
+                                              boost::posix_time::seconds(1)))
+                return;
         }
-
-        return true;
-
     }
 
     void initOpTimeFromOplog(OperationContext* txn, const std::string& oplogNS) {

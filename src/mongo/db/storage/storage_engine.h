@@ -40,10 +40,10 @@ namespace mongo {
     class DatabaseCatalogEntry;
     class OperationContext;
     class RecoveryUnit;
+    struct StorageGlobalParams;
 
     class StorageEngine {
     public:
-        virtual ~StorageEngine() {}
 
         virtual RecoveryUnit* newRecoveryUnit( OperationContext* opCtx ) = 0;
 
@@ -60,11 +60,38 @@ namespace mongo {
          */
         virtual int flushAllFiles( bool sync ) = 0;
 
-        virtual Status repairDatabase( OperationContext* tnx,
+        virtual Status repairDatabase( OperationContext* txn,
                                        const std::string& dbName,
                                        bool preserveClonedFilesOnFailure = false,
                                        bool backupOriginalFiles = false ) = 0;
+
+        /**
+         * Will be called before a clean shutdown.
+         * Override if you have clean-up to do that is different from unclean shutdown.
+         * There is intentionally no uncleanShutdown().
+         */
+        virtual void cleanShutdown(OperationContext* txn) {}
+
+        class Factory {
+        public:
+            virtual ~Factory(){}
+            virtual StorageEngine* create( const StorageGlobalParams& params ) const = 0;
+        };
+
+        static void registerFactory( const std::string& name, const Factory* factory );
+
+    protected:
+        /**
+         * The destructor will never be called. See cleanShutdown instead.
+         */
+        virtual ~StorageEngine() {}
     };
+
+    /**
+     * Sets up the globalStorageEngine pointer and performs any startup work needed by the selected
+     * storage engine. This must be called at a point where it is safe to spawn worker threads.
+     */
+    void initGlobalStorageEngine();
 
     // TODO: this is temporary
     extern StorageEngine* globalStorageEngine;

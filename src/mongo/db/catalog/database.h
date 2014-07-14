@@ -147,7 +147,6 @@ namespace mongo {
         boost::scoped_ptr<DatabaseCatalogEntry> _dbEntry;
 
         const std::string _profileName; // "alleyinsider.system.profile"
-        const std::string _namespacesName; // "alleyinsider.system.namespaces"
         const std::string _indexesName; // "alleyinsider.system.indexes"
 
         int _profile; // 0=off.
@@ -163,5 +162,16 @@ namespace mongo {
         friend class NamespaceDetails;
         friend class IndexCatalog;
     };
+
+    void dropDatabase(OperationContext* txn, Database* db );
+
+    void dropAllDatabasesExceptLocal(OperationContext* txn);
+
+    Status userCreateNS( OperationContext* txn,
+                         Database* db,
+                         const StringData& ns,
+                         BSONObj options,
+                         bool logForReplication,
+                         bool createDefaultIndexes = true );
 
 } // namespace mongo

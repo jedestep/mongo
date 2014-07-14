@@ -33,11 +33,16 @@
 #include "mongo/db/client.h"
 #include "mongo/db/curop.h"
 #include "mongo/db/catalog/database_holder.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/util/net/message.h"
 
 namespace mongo {
 
+namespace repl {
+    class ReplSettings;
+} // namespace repl
+
     extern void (*snmpInit)();
+
+    void setGlobalReplSettings(const repl::ReplSettings& settings);
 
 } // namespace mongo

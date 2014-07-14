@@ -1,5 +1,5 @@
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,6 +36,8 @@
    local.pair.sync       - [deprecated] { initialsynccomplete: 1 }
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/master_slave.h"
 
 #include <pcrecpp.h>
@@ -51,14 +53,18 @@
 #include "mongo/db/ops/update.h"
 #include "mongo/db/query/internal_plans.h"
 #include "mongo/db/repl/oplog.h"
-#include "mongo/db/repl/repl_settings.h"  // replSettings
+#include "mongo/db/repl/repl_coordinator_global.h"
 #include "mongo/db/repl/rs.h" // replLocalAuth()
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/util/exit.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     void pretouchOperation(OperationContext* txn, const BSONObj& op);
@@ -180,6 +186,7 @@ namespace repl {
                 _me = b.obj();
                 Helpers::putSingleton(&txn, "local.me", _me);
             }
+            ctx.commit();
         }
     }
 
@@ -196,9 +203,10 @@ namespace repl {
         LOG( 1 ) << "Saving repl source: " << o << endl;
 
         {
-            OpDebug debug;
-            Client::Context ctx("local.sources");
             OperationContextImpl txn;
+            OpDebug debug;
+
+            Client::Context ctx(&txn, "local.sources");
 
             const NamespaceString requestNs("local.sources");
             UpdateRequest request(requestNs);
@@ -234,17 +242,19 @@ namespace repl {
     */
     void ReplSource::loadAll(OperationContext* txn, SourceVector &v) {
         const char* localSources = "local.sources";
-        Client::Context ctx(localSources);
+        Client::Context ctx(txn, localSources);
         SourceVector old = v;
         v.clear();
 
+        const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if (!replSettings.source.empty()) {
             // --source <host> specified.
             // check that no items are in sources other than that
             // add if missing
             int n = 0;
             auto_ptr<Runner> runner(
-                InternalPlanner::collectionScan(localSources,
+                InternalPlanner::collectionScan(txn,
+                                                localSources,
                                                 ctx.db()->getCollection(txn, localSources)));
             BSONObj obj;
             Runner::RunnerState state;
@@ -288,14 +298,15 @@ namespace repl {
         }
 
         auto_ptr<Runner> runner(
-            InternalPlanner::collectionScan(localSources,
+            InternalPlanner::collectionScan(txn,
+                                            localSources,
                                             ctx.db()->getCollection(txn, localSources)));
         BSONObj obj;
         Runner::RunnerState state;
         while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
             ReplSource tmp(obj);
             if ( tmp.syncedTo.isNull() ) {
-                DBDirectClient c;
+                DBDirectClient c(txn);
                 if ( c.exists( "local.oplog.$main" ) ) {
                     BSONObj op = c.findOne( "local.oplog.$main", QUERY( "op" << NE << "n" ).sort( BSON( "$natural" << -1 ) ) );
                     if ( !op.isEmpty() ) {
@@ -364,7 +375,7 @@ namespace repl {
 
     void ReplSource::resyncDrop( OperationContext* txn, const string& db ) {
         log() << "resync: dropping database " << db;
-        Client::Context ctx(db);
+        Client::Context ctx(txn, db);
         dropDatabase(txn, ctx.db());
     }
 
@@ -513,8 +524,9 @@ namespace repl {
             ___databaseIgnorer.doIgnoreUntilAfter( *i, lastTime );
             incompleteCloneDbs.erase(*i);
             addDbNextPass.erase(*i);
-            Client::Context ctx(*i);
-            dropDatabase(txn, ctx.db() );
+
+            Client::Context ctx(txn, *i);
+            dropDatabase(txn, ctx.db());
         }
         
         massert(14034, "Duplicate database names present after attempting to delete duplicates",
@@ -577,6 +589,7 @@ namespace repl {
         if ( !only.empty() && only != clientName )
             return;
 
+        const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if (replSettings.pretouch &&
             !alreadyLocked/*doesn't make sense if in write lock already*/) {
             if (replSettings.pretouch > 1) {
@@ -626,11 +639,11 @@ namespace repl {
         if (!handleDuplicateDbName(txn, op, ns, clientName)) {
             return;   
         }
-                
+
         // This code executes on the slaves only, so it doesn't need to be sharding-aware since
         // mongos will not send requests there. That's why the last argument is false (do not do
         // version checking).
-        Client::Context ctx(ns, false);
+        Client::Context ctx(txn, ns, false);
         ctx.getClient()->curop()->reset();
 
         bool empty = ctx.db()->getDatabaseCatalogEntry()->isEmpty();
@@ -661,7 +674,7 @@ namespace repl {
                     log() << "An earlier initial clone of '" << clientName << "' did not complete, now resyncing." << endl;
                 }
                 save();
-                Client::Context ctx(ns);
+                Client::Context ctx(txn, ns);
                 nClonedThisPass++;
                 resync(txn, ctx.db()->name());
                 addDbNextPass.erase(clientName);
@@ -712,6 +725,7 @@ namespace repl {
                                "replApplyBatchSize has to be >= 1 and < 1024" );
             }
 
+            const ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
             if ( replSettings.slavedelay != 0 && b > 1 ) {
                 return Status( ErrorCodes::BadValue,
                                "can't use a batch size > 1 with slavedelay" );
@@ -948,6 +962,8 @@ namespace repl {
                         replInfo = replAllDead = "sync error last >= nextOpTime";
                         uassert( 10123 , "replication error last applied optime at slave >= nextOpTime from master", false);
                     }
+                    const ReplSettings& replSettings =
+                            getGlobalReplicationCoordinator()->getSettings();
                     if ( replSettings.slavedelay && ( unsigned( time( 0 ) ) < nextOpTime.getSecs() + replSettings.slavedelay ) ) {
                         verify( justOne );
                         oplogReader.putBack( op );
@@ -1037,7 +1053,8 @@ namespace repl {
             Lock::GlobalWrite lk(txn.lockState());
             ReplSource::loadAll(&txn, sources);
 
-            replSettings.fastsync = false; // only need this param for initial reset
+            // only need this param for initial reset
+            getGlobalReplicationCoordinator()->getSettings().fastsync = false;
         }
 
         if ( sources.empty() ) {
@@ -1108,7 +1125,8 @@ namespace repl {
                 Lock::GlobalWrite lk(txn.lockState());
                 if ( replAllDead ) {
                     // throttledForceResyncDead can throw
-                    if ( !replSettings.autoresync || !ReplSource::throttledForceResyncDead( &txn, "auto" ) ) {
+                    if ( !getGlobalReplicationCoordinator()->getSettings().autoresync ||
+                            !ReplSource::throttledForceResyncDead( &txn, "auto" ) ) {
                         log() << "all sources dead: " << replAllDead << ", sleeping for 5 seconds" << endl;
                         break;
                     }
@@ -1228,6 +1246,7 @@ namespace repl {
 
         oldRepl();
 
+        ReplSettings& replSettings = getGlobalReplicationCoordinator()->getSettings();
         if( !replSettings.slave && !replSettings.master )
             return;
 
@@ -1285,7 +1304,7 @@ namespace repl {
                     BSONObjBuilder b;
                     b.append(_id);
                     BSONObj result;
-                    Client::Context ctx( ns );
+                    Client::Context ctx(&txn, ns);
                     if( Helpers::findById(&txn, ctx.db(), ns, b.done(), result) )
                         _dummy_z += result.objsize(); // touch
                 }

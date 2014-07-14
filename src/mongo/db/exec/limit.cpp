@@ -45,6 +45,9 @@ namespace mongo {
     PlanStage::StageState LimitStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (0 == _numToReturn) {
             // We've returned as many results as we're limited to.
             return PlanStage::IS_EOF;
@@ -95,6 +98,12 @@ namespace mongo {
         _child->invalidate(dl, type);
     }
 
+    vector<PlanStage*> LimitStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
+    }
+
     PlanStageStats* LimitStage::getStats() {
         _commonStats.isEOF = isEOF();
         _specificStats.limit = _numToReturn;
@@ -102,6 +111,14 @@ namespace mongo {
         ret->specific.reset(new LimitStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* LimitStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* LimitStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

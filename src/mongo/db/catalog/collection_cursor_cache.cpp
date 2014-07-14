@@ -191,7 +191,7 @@ namespace mongo {
         Database* db = dbHolder().get(txn, ns);
         if ( !db )
             return false;
-        Client::Context context( ns, db );
+        Client::Context context(txn, ns, db );
         Collection* collection = db->getCollection( txn, ns );
         if ( !collection ) {
             if ( checkAuth )
@@ -221,7 +221,7 @@ namespace mongo {
             Database* db = dbHolder().get(txn, ns);
             if ( !db )
                 continue;
-            Client::Context context( ns, db );
+            Client::Context context(txn,  ns, db );
             Collection* collection = db->getCollection( txn, ns );
             if ( collection == NULL ) {
                 continue;
@@ -388,14 +388,18 @@ namespace mongo {
     }
 
     void CollectionCursorCache::registerRunner( Runner* runner ) {
-        SimpleMutex::scoped_lock lk( _mutex );
-        const std::pair<RunnerSet::iterator, bool> result = _nonCachedRunners.insert(runner);
-        invariant(result.second); // make sure this was inserted
+        if (!useExperimentalDocLocking) {
+            SimpleMutex::scoped_lock lk(_mutex);
+            const std::pair<RunnerSet::iterator, bool> result = _nonCachedRunners.insert(runner);
+            invariant(result.second); // make sure this was inserted
+        }
     }
 
     void CollectionCursorCache::deregisterRunner( Runner* runner ) {
-        SimpleMutex::scoped_lock lk( _mutex );
-        _nonCachedRunners.erase( runner );
+        if (!useExperimentalDocLocking) {
+            SimpleMutex::scoped_lock lk(_mutex);
+            _nonCachedRunners.erase(runner);
+        }
     }
 
     ClientCursor* CollectionCursorCache::find( CursorId id, bool pin ) {

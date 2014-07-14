@@ -1,4 +1,4 @@
-// commands.cpp
+// dbeval.cpp
 
 /**
 *    Copyright (C) 2012 10gen Inc.
@@ -40,7 +40,6 @@
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
 #include "mongo/db/json.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/scripting/engine.h"
 
 namespace mongo {
@@ -144,7 +143,8 @@ namespace mongo {
             }
 
             Lock::GlobalWrite lk(txn->lockState());
-            Client::Context ctx( dbname );
+            // No WriteUnitOfWork necessary, as dbEval will create its own, see "nolock" case above
+            Client::Context ctx(txn,  dbname );
 
             return dbEval(dbname, cmdObj, result, errmsg);
         }

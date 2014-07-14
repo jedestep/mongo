@@ -41,11 +41,12 @@
 #include <fstream>
 
 #include "mongo/db/db.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/db/storage/mmap_v1/durable_mapped_file.h"
 #include "mongo/db/storage/mmap_v1/dur_stats.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/json.h"
-#include "mongo/db/structure/btree/key.h"
+#include "mongo/db/storage/mmap_v1/btree/key.h"
 #include "mongo/db/lasterror.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/dbtests/framework_options.h"
@@ -68,18 +69,14 @@ namespace PerfTests {
 
     const bool profiling = false;
 
-    typedef DBDirectClient DBClientType;
-    //typedef DBClientConnection DBClientType;
-
     class ClientBase {
     public:
         // NOTE: Not bothering to backup the old error record.
-        ClientBase() {
-            //_client.connect("localhost");
-            mongo::lastError.reset( new LastError() );
+        ClientBase() : _client(&_txn) {
+            mongo::lastError.reset(new LastError());
         }
         virtual ~ClientBase() {
-            //mongo::lastError.release();
+
         }
     protected:
         void insert( const char *ns, BSONObj o ) {
@@ -91,9 +88,12 @@ namespace PerfTests {
         bool error() {
             return !_client.getPrevError().getField( "err" ).isNull();
         }
+
         DBClientBase* client() { return &_client; }
+
     private:
-        DBClientType _client;
+        OperationContextImpl _txn;
+        DBDirectClient _client;
     };
 
     /* if you want recording of the timings, place the password for the perf database
@@ -358,7 +358,9 @@ namespace PerfTests {
             static int z;
             srand( ++z ^ (unsigned) time(0));
 #endif
-            DBClientType c;
+            OperationContextImpl txn;
+            DBDirectClient c(&txn);
+
             Client::initThreadIfNotAlready("perftestthr");
             const unsigned int Batch = batchSize();
             while( 1 ) {

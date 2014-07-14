@@ -43,9 +43,6 @@
 namespace IndexUpdateTests {
 
     static const char* const _ns = "unittests.indexupdate";
-#if 0
-    ExternalSortComparison* _aFirstSort = BtreeBasedBulkAccessMethod::getComparison(0, BSON("a" << 1));
-#endif
 
     /**
      * Test fixture for a write locked test using collection _ns.  Includes functionality to
@@ -55,12 +52,14 @@ namespace IndexUpdateTests {
     class IndexBuildBase {
     public:
         IndexBuildBase() :
-            _ctx(&_txn, _ns) {
+            _ctx(&_txn, _ns),
+            _client(&_txn) {
+
             _client.createCollection( _ns );
-            setGlobalEnvironment(new GlobalEnvironmentMongoD());
         }
         ~IndexBuildBase() {
             _client.dropCollection( _ns );
+            _ctx.commit(); // just for testing purposes
             getGlobalEnvironment()->unsetKillAllOperations();
         }
         Collection* collection() {
@@ -93,9 +92,9 @@ namespace IndexUpdateTests {
         }
 #endif
 
-        DBDirectClient _client;
         OperationContextImpl _txn;
         Client::WriteContext _ctx;
+        DBDirectClient _client;
     };
 
     /** addKeysToPhaseOne() adds keys from a collection's documents to an external sorter. */
@@ -471,6 +470,7 @@ namespace IndexUpdateTests {
     public:
         void run() {
             OperationContextImpl txn;
+            WriteUnitOfWork wunit (txn.recoveryUnit());
             // Insert some documents.
             int32_t nDocs = 1000;
             for( int32_t i = 0; i < nDocs; ++i ) {
@@ -483,6 +483,7 @@ namespace IndexUpdateTests {
             // The call is not interrupted.
             Helpers::ensureIndex( &txn, collection(), BSON( "a" << 1 ), false, "a_1" );
             // only want to interrupt the index build
+            wunit.commit();
             getGlobalEnvironment()->unsetKillAllOperations();
             // The new index is listed in system.indexes because the index build completed.
             ASSERT_EQUALS( 1U,

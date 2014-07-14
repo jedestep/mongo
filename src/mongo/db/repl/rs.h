@@ -65,15 +65,12 @@
 namespace mongo {
 namespace repl {
 
-    extern bool replSet; // true if using repl sets
     extern class ReplSet *theReplSet; // null until initialized
 
     class ReplSetSeedList;
 
     // Main entry point for replica sets
     void startReplSets(ReplSetSeedList *replSetSeedList);
-
-    bool isCurrentlyAReplSetPrimary();
 
     /**
      * does local authentication

@@ -26,6 +26,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/repl/sync_source_feedback.h"
 
 #include "mongo/client/constants.h"
@@ -38,16 +40,19 @@
 #include "mongo/db/repl/bgsync.h"
 #include "mongo/db/repl/rs.h"  // theReplSet
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/util/log.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kReplication);
+
 namespace repl {
 
     // used in replAuthenticate
     static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
-    void SyncSourceFeedback::associateMember(const BSONObj& id, Member* member) {
+    void SyncSourceFeedback::associateMember(const OID& rid, Member* member) {
         invariant(member);
-        const OID rid = id["_id"].OID();
         boost::unique_lock<boost::mutex> lock(_mtx);
         _handshakeNeeded = true;
         _members[rid] = member;
@@ -84,6 +89,7 @@ namespace repl {
                 _me = b.obj();
                 Helpers::putSingleton(&txn, "local.me", _me);
             }
+            ctx.commit();
             // _me is used outside of a read lock, so we must copy it out of the mmap
             _me = _me.getOwned();
         }
@@ -210,6 +216,7 @@ namespace repl {
         array.done();
         BSONObj res;
 
+        LOG(2) << "Sending slave oplog progress to upstream updater";
         bool ok;
         try {
             ok = _connection->runCommand("admin", cmd.obj(), res);

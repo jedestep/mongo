@@ -84,6 +84,9 @@ namespace mongo {
             // SERVER-4328 todo : is global ok or does this take a long time? i believe multiple 
             // ns used so locking individually requires more analysis
             Lock::GlobalWrite globalWriteLock(txn->lockState());
+            WriteUnitOfWork wunit(txn->recoveryUnit());
+
+            DBDirectClient db(txn);
 
             // Preconditions check reads the database state, so needs to be done locked
             if ( cmdObj["preCondition"].type() == Array ) {
@@ -131,7 +134,7 @@ namespace mongo {
                 Lock::DBWrite lk(txn->lockState(), ns);
                 invariant(txn->lockState()->isRecursive());
 
-                Client::Context ctx(ns);
+                Client::Context ctx(txn, ns);
                 bool failed = repl::applyOperation_inlock(txn,
                                                              ctx.db(),
                                                              temp,
@@ -170,9 +173,13 @@ namespace mongo {
                 repl::logOp(txn, "c", tempNS.c_str(), cmdBuilder.done());
             }
 
-            return errors == 0;
-        }
+            if (errors != 0) {
+                return false;
+            }
 
+            wunit.commit();
+            return true;
+        }
     } applyOpsCmd;
 
 }

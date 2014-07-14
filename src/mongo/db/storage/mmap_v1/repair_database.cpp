@@ -28,6 +28,8 @@
 *    it in the license file.
 */
 
+#include "mongo/platform/basic.h"
+
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
 
 #include <boost/filesystem/operations.hpp>
@@ -42,9 +44,12 @@
 #include "mongo/db/storage/mmap_v1/mmap_v1_database_catalog_entry.h"
 #include "mongo/util/file.h"
 #include "mongo/util/file_allocator.h"
+#include "mongo/util/log.h"
 #include "mongo/util/mmap.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kStorage);
 
     typedef boost::filesystem::path Path;
 
@@ -247,7 +252,9 @@ namespace mongo {
 
             try {
                 _txn->recoveryUnit()->syncDataAndTruncateJournal();
+
                 globalStorageEngine->flushAllFiles(true); // need both in case journaling is disabled
+
                 MONGO_ASSERT_ON_EXCEPTION( boost::filesystem::remove_all( _path ) );
             }
             catch ( DBException& e ) {
@@ -335,12 +342,13 @@ namespace mongo {
             map<string,CollectionOptions> namespacesToCopy;
             {
                 string ns = dbName + ".system.namespaces";
-                Client::Context ctx( ns );
+                Client::Context ctx(txn,  ns );
                 Collection* coll = originalDatabase->getCollection( txn, ns );
                 if ( coll ) {
-                    scoped_ptr<RecordIterator> it( coll->getIterator( DiskLoc(),
-                                                                          false,
-                                                                          CollectionScanParams::FORWARD ) );
+                    scoped_ptr<RecordIterator> it( coll->getIterator( txn,
+                                                                      DiskLoc(),
+                                                                      false,
+                                                                      CollectionScanParams::FORWARD ) );
                     while ( !it->isEOF() ) {
                         DiskLoc loc = it->getNext();
                         BSONObj obj = coll->docFor( loc );
@@ -377,11 +385,11 @@ namespace mongo {
 
                 Collection* tempCollection = NULL;
                 {
-                    Client::Context tempContext( ns, tempDatabase );
+                    Client::Context tempContext(txn, ns, tempDatabase );
                     tempCollection = tempDatabase->createCollection( txn, ns, options, true, false );
                 }
 
-                Client::Context readContext( ns, originalDatabase );
+                Client::Context readContext(txn, ns, originalDatabase);
                 Collection* originalCollection = originalDatabase->getCollection( txn, ns );
                 invariant( originalCollection );
 
@@ -397,23 +405,23 @@ namespace mongo {
                         indexes.push_back( desc->infoObj() );
                     }
 
-                    Client::Context tempContext( ns, tempDatabase );
+                    Client::Context tempContext(txn, ns, tempDatabase);
                     Status status = indexBlock.init( indexes );
                     if ( !status.isOK() )
                         return status;
 
                 }
 
-                scoped_ptr<RecordIterator> iterator( originalCollection->getIterator( DiskLoc(),
-                                                                                          false,
-                                                                                          CollectionScanParams::FORWARD ) );
+                scoped_ptr<RecordIterator> iterator(
+                    originalCollection->getIterator( txn, DiskLoc(), false,
+                                                     CollectionScanParams::FORWARD ));
                 while ( !iterator->isEOF() ) {
                     DiskLoc loc = iterator->getNext();
                     invariant( !loc.isNull() );
 
                     BSONObj doc = originalCollection->docFor( loc );
 
-                    Client::Context tempContext( ns, tempDatabase );
+                    Client::Context tempContext(txn, ns, tempDatabase);
                     StatusWith<DiskLoc> result = tempCollection->insertDocument( txn, doc, indexBlock );
                     if ( !result.isOK() )
                         return result.getStatus();
@@ -423,7 +431,7 @@ namespace mongo {
                 }
 
                 {
-                    Client::Context tempContext( ns, tempDatabase );
+                    Client::Context tempContext(txn, ns, tempDatabase);
                     Status status = indexBlock.commit();
                     if ( !status.isOK() )
                         return status;
@@ -435,7 +443,6 @@ namespace mongo {
             globalStorageEngine->flushAllFiles(true); // need both in case journaling is disabled
 
             txn->checkForInterrupt(false);
-
         }
 
         // at this point if we abort, we don't want to delete new files
@@ -444,7 +451,7 @@ namespace mongo {
         if ( repairFileDeleter.get() )
             repairFileDeleter->success();
 
-        Client::Context ctx( dbName );
+        Client::Context ctx(txn, dbName);
         Database::closeDatabase(txn, dbName);
 
         if ( backupOriginalFiles ) {

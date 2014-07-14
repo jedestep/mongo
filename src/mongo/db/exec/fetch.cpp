@@ -31,7 +31,6 @@
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/exec/filter.h"
 #include "mongo/db/exec/working_set_common.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/util/fail_point_service.h"
 #include "mongo/util/mongoutils/str.h"
 
@@ -59,6 +58,9 @@ namespace mongo {
     PlanStage::StageState FetchStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         // If we're here, we're not waiting for a DiskLoc to be fetched.  Get another to-be-fetched
@@ -83,6 +85,8 @@ namespace mongo {
                 member->obj = _collection->docFor(member->loc);
                 member->state = WorkingSetMember::LOC_AND_UNOWNED_OBJ;
             }
+
+            ++_specificStats.docsExamined;
 
             return returnIfMatches(member, id, out);
         }
@@ -144,6 +148,12 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> FetchStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
+    }
+
     PlanStageStats* FetchStage::getStats() {
         _commonStats.isEOF = isEOF();
 
@@ -158,6 +168,14 @@ namespace mongo {
         ret->specific.reset(new FetchStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* FetchStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* FetchStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

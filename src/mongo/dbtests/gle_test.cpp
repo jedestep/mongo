@@ -26,6 +26,7 @@
  *    then also delete it in the license file.
  */
 
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 #include "mongo/util/assert_util.h"
 
@@ -43,8 +44,11 @@ namespace {
     class GetLastErrorCommandFailure {
     public:
         void run() {
-            DBDirectClient client;
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
             client.insert(_ns, BSON( "test" << "test"));
+
             // Cannot mix fsync + j, will make command fail
             string gleString = client.getLastError(true, true, 10, 10);
             ASSERT_NOT_EQUALS(gleString, "");
@@ -57,8 +61,11 @@ namespace {
     class GetLastErrorClean {
     public:
         void run() {
-            DBDirectClient client;
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
             client.insert(_ns, BSON( "test" << "test"));
+
             // Make sure there was no error
             string gleString = client.getLastError();
             ASSERT_EQUALS(gleString, "");
@@ -71,8 +78,11 @@ namespace {
     class GetLastErrorFromDup {
     public:
         void run() {
-            DBDirectClient client;
+            OperationContextImpl txn;
+            DBDirectClient client(&txn);
+
             client.insert(_ns, BSON( "_id" << 1));
+
             // Make sure there was no error
             string gleString = client.getLastError();
             ASSERT_EQUALS(gleString, "");

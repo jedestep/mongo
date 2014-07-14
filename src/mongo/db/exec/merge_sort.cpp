@@ -67,6 +67,9 @@ namespace mongo {
     PlanStage::StageState MergeSortStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (isEOF()) { return PlanStage::IS_EOF; }
 
         if (!_noResultToMerge.empty()) {
@@ -246,6 +249,10 @@ namespace mongo {
         return false;
     }
 
+    vector<PlanStage*> MergeSortStage::getChildren() const {
+        return _children;
+    }
+
     PlanStageStats* MergeSortStage::getStats() {
         _commonStats.isEOF = isEOF();
 
@@ -257,6 +264,14 @@ namespace mongo {
             ret->children.push_back(_children[i]->getStats());
         }
         return ret.release();
+    }
+
+    const CommonStats* MergeSortStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* MergeSortStage::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

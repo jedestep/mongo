@@ -71,7 +71,7 @@ namespace mongo {
         virtual void getCollectionNamespaces( std::list<std::string>* out ) const;
 
         virtual CollectionCatalogEntry* getCollectionCatalogEntry( OperationContext* txn,
-                                                                   const StringData& ns );
+                                                                   const StringData& ns ) const;
 
         virtual RecordStore* getRecordStore( OperationContext* txn,
                                              const StringData& ns );
@@ -102,12 +102,15 @@ namespace mongo {
             DiskLoc head;
             bool ready;
             bool isMultikey;
-            scoped_ptr<IndexAccessMethod> access;
+            
+            // Only one of these will be in use. See getIndex() implementation.
+            scoped_ptr<RecordStore> rs; // used by Btree on HeapRecordStore
+            shared_ptr<void> data; // used by Heap1BtreeImpl
         };
 
         class Entry : public CollectionCatalogEntry {
         public:
-            Entry( const StringData& ns );
+            Entry( const StringData& ns, const CollectionOptions& options );
             virtual ~Entry();
 
             int getTotalIndexCount() const;
@@ -147,6 +150,9 @@ namespace mongo {
                                    const StringData& idxName,
                                    long long newExpireSeconds );
 
+            CollectionOptions getCollectionOptions(OperationContext* txn) const { return options; }
+
+            CollectionOptions options;
             scoped_ptr<HeapRecordStore> rs;
             typedef std::map<std::string,IndexEntry*> Indexes;
             Indexes indexes;

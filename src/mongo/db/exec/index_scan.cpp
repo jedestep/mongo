@@ -1,5 +1,5 @@
 /**
- *    Copyright (C) 2013 10gen Inc.
+ *    Copyright (C) 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -51,9 +51,13 @@ namespace mongo {
     // static
     const char* IndexScan::kStageType = "IXSCAN";
 
-    IndexScan::IndexScan(const IndexScanParams& params, WorkingSet* workingSet,
+    IndexScan::IndexScan(OperationContext* txn,
+                         const IndexScanParams& params,
+                         WorkingSet* workingSet,
                          const MatchExpression* filter)
-        : _workingSet(workingSet),
+        : _txn(txn),
+          _checkEndKeys(0),
+          _workingSet(workingSet),
           _hitEnd(false),
           _filter(filter), 
           _shouldDedup(true),
@@ -63,6 +67,7 @@ namespace mongo {
           _commonStats(kStageType) {
         _iam = _params.descriptor->getIndexCatalog()->getIndex(_params.descriptor);
         _keyPattern = _params.descriptor->keyPattern().getOwned();
+        _specificStats.keyPattern = _keyPattern;
     }
 
     void IndexScan::initIndexScan() {
@@ -90,7 +95,7 @@ namespace mongo {
         }
 
         IndexCursor *cursor;
-        Status s = _iam->newCursor(cursorOptions, &cursor);
+        Status s = _iam->newCursor(_txn, cursorOptions, &cursor);
         verify(s.isOK());
         _indexCursor.reset(cursor);
 
@@ -131,10 +136,24 @@ namespace mongo {
     PlanStage::StageState IndexScan::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
+        // If we examined multiple keys in a prior work cycle, make up for it here by returning
+        // NEED_TIME. This is done for plan ranking. Refer to the comment for '_checkEndKeys'
+        // in the .h for details.
+        if (_checkEndKeys > 0) {
+            --_checkEndKeys;
+            ++_commonStats.needTime;
+            return PlanStage::NEED_TIME;
+        }
+
         if (NULL == _indexCursor.get()) {
             // First call to work().  Perform possibly heavy init.
             initIndexScan();
             checkEnd();
+            ++_commonStats.needTime;
+            return PlanStage::NEED_TIME;
         }
         else if (_yieldMovedCursor) {
             _yieldMovedCursor = false;
@@ -211,22 +230,28 @@ namespace mongo {
             }
         }
 
+        if (_checkEndKeys != 0) {
+            return false;
+        }
+
         return _hitEnd || _indexCursor->isEOF();
     }
 
     void IndexScan::prepareToYield() {
         ++_commonStats.yields;
 
-        if (isEOF() || (NULL == _indexCursor.get())) { return; }
-        _savedKey = _indexCursor->getKey().getOwned();
-        _savedLoc = _indexCursor->getValue();
+        if (_hitEnd || (NULL == _indexCursor.get())) { return; }
+        if (!_indexCursor->isEOF()) {
+            _savedKey = _indexCursor->getKey().getOwned();
+            _savedLoc = _indexCursor->getValue();
+        }
         _indexCursor->savePosition();
     }
 
     void IndexScan::recoverFromYield() {
         ++_commonStats.unyields;
 
-        if (isEOF() || (NULL == _indexCursor.get())) { return; }
+        if (_hitEnd || (NULL == _indexCursor.get())) { return; }
 
         // We can have a valid position before we check isEOF(), restore the position, and then be
         // EOF upon restore.
@@ -331,10 +356,14 @@ namespace mongo {
                     break;
                 }
 
-                // TODO: Can we do too much scanning here?  Old BtreeCursor stops scanning after a
-                // while and relies on a Matcher to make sure the result is ok.
+                ++_checkEndKeys;
             }
         }
+    }
+
+    vector<PlanStage*> IndexScan::getChildren() const {
+        vector<PlanStage*> empty;
+        return empty;
     }
 
     PlanStageStats* IndexScan::getStats() {
@@ -364,12 +393,19 @@ namespace mongo {
 
             _specificStats.indexBoundsVerbose = _params.bounds.toString();
             _specificStats.direction = _params.direction;
-            _specificStats.keyPattern = _keyPattern;
         }
 
         auto_ptr<PlanStageStats> ret(new PlanStageStats(_commonStats, STAGE_IXSCAN));
         ret->specific.reset(new IndexScanStats(_specificStats));
         return ret.release();
+    }
+
+    const CommonStats* IndexScan::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* IndexScan::getSpecificStats() {
+        return &_specificStats;
     }
 
 }  // namespace mongo

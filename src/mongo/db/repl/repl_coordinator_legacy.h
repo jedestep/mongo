@@ -42,7 +42,7 @@ namespace repl {
 
     public:
 
-        LegacyReplicationCoordinator();
+        LegacyReplicationCoordinator(const ReplSettings& settings);
         virtual ~LegacyReplicationCoordinator();
 
         virtual void startReplication(TopologyCoordinator*,
@@ -51,6 +51,8 @@ namespace repl {
         virtual void shutdown();
 
         virtual bool isShutdownOkay() const;
+
+        virtual ReplSettings& getSettings();
 
         virtual Mode getReplicationMode() const;
 
@@ -77,21 +79,78 @@ namespace repl {
 
         virtual bool canAcceptWritesForDatabase(const StringData& dbName);
 
-        virtual bool canServeReadsFor(const NamespaceString& collection);
+        virtual Status canServeReadsFor(const NamespaceString& ns, bool slaveOk);
 
         virtual bool shouldIgnoreUniqueIndex(const IndexDescriptor* idx);
 
-        virtual Status setLastOptime(const OID& rid, const OpTime& ts, const BSONObj& config);
+        virtual Status setLastOptime(const OID& rid, const OpTime& ts);
+
+        virtual OID getElectionId();
 
         virtual void processReplSetGetStatus(BSONObjBuilder* result);
 
+        virtual bool setMaintenanceMode(bool activate);
+
+        virtual Status processReplSetMaintenance(bool activate, BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetSyncFrom(const std::string& target,
+                                              BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetFreeze(int secs, BSONObjBuilder* resultObj);
+
         virtual Status processHeartbeat(const BSONObj& cmdObj, BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetReconfig(OperationContext* txn,
+                                              const ReplSetReconfigArgs& args,
+                                              BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetInitiate(OperationContext* txn,
+                                              const BSONObj& configObj,
+                                              BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetGetRBID(BSONObjBuilder* resultObj);
+
+        virtual void incrementRollbackID();
+
+        virtual Status processReplSetFresh(const ReplSetFreshArgs& args,
+                                           BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetElect(const ReplSetElectArgs& args,
+                                           BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetUpdatePosition(const BSONArray& updates,
+                                                    BSONObjBuilder* resultObj);
+
+        virtual Status processReplSetUpdatePositionHandshake(const BSONObj& handshake,
+                                                             BSONObjBuilder* resultObj);
+
+        virtual bool processHandshake(const OID& remoteID, const BSONObj& handshake);
+
+        virtual void waitUpToOneSecondForOptimeChange(const OpTime& ot);
+
+        virtual bool buildsIndexes();
+
+        virtual std::vector<BSONObj> getHostsWrittenTo(const OpTime& op);
 
     private:
         Status _stepDownHelper(bool force,
                                const Milliseconds& initialWaitTime,
                                const Milliseconds& stepdownTime,
                                const Milliseconds& postStepdownWaitTime);
+
+        Status _checkReplEnabledForCommand(BSONObjBuilder* result);
+
+        // Mutex that protects the _ridConfigMap
+        boost::mutex _ridConfigMapMutex;
+
+        // Map from RID to member config object
+        std::map<OID, BSONObj> _ridConfigMap;
+
+        // Rollback id. used to check if a rollback happened during some interval of time
+        // TODO: ideally this should only change on rollbacks NOT on mongod restarts also.
+        int _rbid;
+
+        ReplSettings _settings;
     };
 
 } // namespace repl

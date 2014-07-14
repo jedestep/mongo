@@ -30,7 +30,6 @@
 
 #include "mongo/db/storage/storage_engine.h"
 
-#include "mongo/base/init.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/storage/heap1/heap1_engine.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_engine.h"
@@ -40,10 +39,18 @@ namespace mongo {
 
     StorageEngine* globalStorageEngine = 0;
 
-    MONGO_INITIALIZER_GENERAL(StorageEngineInit,
-                              ("EndStartupOptionStorage"),
-                              MONGO_NO_DEPENDENTS )
-        (InitializerContext* context) {
+    namespace {
+        std::map<std::string,const StorageEngine::Factory*> factorys;
+    } // namespace
+
+    void StorageEngine::registerFactory( const std::string& name,
+                                         const StorageEngine::Factory* factory ) {
+        invariant( factorys.count(name) == 0 );
+        factorys[name] = factory;
+    }
+
+    void initGlobalStorageEngine() {
+        // TODO these should use the StorageEngine::Factory system
         if ( storageGlobalParams.engine == "mmapv1" ) {
             globalStorageEngine = new MMAPV1Engine();
         }
@@ -51,10 +58,11 @@ namespace mongo {
             globalStorageEngine = new Heap1Engine();
         }
         else {
-            log() << "unknown storage engine: " << storageGlobalParams.engine;
-            return Status( ErrorCodes::BadValue, "unknown storage engine" );
+            const StorageEngine::Factory* factory = factorys[storageGlobalParams.engine];
+            uassert(18525, "unknown storage engine: " + storageGlobalParams.engine,
+                    factory);
+            globalStorageEngine = factory->create( storageGlobalParams );
         }
-        return Status::OK();
     }
 }
 

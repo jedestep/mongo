@@ -38,7 +38,6 @@
 #include "mongo/db/catalog/database_holder.h"
 #include "mongo/db/introspect.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/storage_options.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/util/goodies.h"
@@ -59,7 +58,7 @@ namespace {
         if (nameIter.more())
             bestUser = *nameIter;
 
-        StringData opdb( nsToDatabaseSubstring( c.getNS() ) );
+        std::string opdb( nsToDatabase( c.getNS() ) );
 
         BSONArrayBuilder allUsers(builder.subarrayStart("allUsers"));
         for ( ; nameIter.more(); nameIter.next()) {
@@ -139,9 +138,11 @@ namespace {
             // we're sometimes inside the lock already
             Lock::DBWrite lk(txn->lockState(), currentOp.getNS() );
             if (dbHolder().get(txn, nsToDatabase(currentOp.getNS())) != NULL) {
-
-                Client::Context cx(currentOp.getNS(), false);
+                // We are ok with the profiling happening in a different WUOW from the actual op.
+                WriteUnitOfWork wunit(txn->recoveryUnit());
+                Client::Context cx(txn, currentOp.getNS(), false);
                 _profile(txn, c, cx.db(), currentOp, profileBufBuilder);
+                wunit.commit();
             }
             else {
                 mongo::log() << "note: not profiling because db went away - probably a close on: "

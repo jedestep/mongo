@@ -1,7 +1,7 @@
 // distinct.cpp
 
 /**
-*    Copyright (C) 2012 10gen Inc.
+*    Copyright (C) 2012-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -39,7 +39,6 @@
 #include "mongo/db/commands.h"
 #include "mongo/db/instance.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/get_runner.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/query/type_explain.h"
@@ -116,7 +115,7 @@ namespace mongo {
             }
 
             Runner* rawRunner;
-            Status status = getRunnerDistinct(collection, query, key, &rawRunner);
+            Status status = getRunnerDistinct(txn, collection, query, key, &rawRunner);
             if (!status.isOK()) {
                 uasserted(17216, mongoutils::str::stream() << "Can't get runner for query "
                               << query << ": " << status.toString());

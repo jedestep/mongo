@@ -304,6 +304,9 @@ namespace mongo {
     PlanStage::StageState SortStage::work(WorkingSetID* out) {
         ++_commonStats.works;
 
+        // Adds the amount of time taken by work() to executionTimeMillis.
+        ScopedTimer timer(&_commonStats.executionTimeMillis);
+
         if (NULL == _sortKeyGen) {
             // This is heavy and should be done as part of work().
             _sortKeyGen.reset(new SortStageKeyGenerator(_collection, _pattern, _query));
@@ -449,6 +452,12 @@ namespace mongo {
         }
     }
 
+    vector<PlanStage*> SortStage::getChildren() const {
+        vector<PlanStage*> children;
+        children.push_back(_child.get());
+        return children;
+    }
+
     PlanStageStats* SortStage::getStats() {
         _commonStats.isEOF = isEOF();
         _specificStats.memLimit = kMaxBytes;
@@ -460,6 +469,14 @@ namespace mongo {
         ret->specific.reset(new SortStats(_specificStats));
         ret->children.push_back(_child->getStats());
         return ret.release();
+    }
+
+    const CommonStats* SortStage::getCommonStats() {
+        return &_commonStats;
+    }
+
+    const SpecificStats* SortStage::getSpecificStats() {
+        return &_specificStats;
     }
 
     /**

@@ -42,11 +42,12 @@
 #include "mongo/db/pdfile_version.h"
 #include "mongo/db/server_parameters.h"
 #include "mongo/db/storage/mmap_v1/data_file.h"
-#include "mongo/db/structure/catalog/namespace_details.h"
-#include "mongo/db/structure/catalog/namespace_details_collection_entry.h"
-#include "mongo/db/structure/catalog/namespace_details_rsv1_metadata.h"
-#include "mongo/db/structure/record_store_v1_capped.h"
-#include "mongo/db/structure/record_store_v1_simple.h"
+#include "mongo/db/storage/mmap_v1/btree/btree_interface.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_collection_entry.h"
+#include "mongo/db/storage/mmap_v1/catalog/namespace_details_rsv1_metadata.h"
+#include "mongo/db/storage/mmap_v1/record_store_v1_capped.h"
+#include "mongo/db/storage/mmap_v1/record_store_v1_simple.h"
 
 namespace mongo {
 
@@ -180,12 +181,11 @@ namespace mongo {
         invariant( details );
 
         RecordStoreV1Base* systemIndexRecordStore = _getIndexRecordStore();
-        scoped_ptr<RecordIterator> it( systemIndexRecordStore->getIterator() );
+        scoped_ptr<RecordIterator> it( systemIndexRecordStore->getIterator(txn) );
 
         while ( !it->isEOF() ) {
             DiskLoc loc = it->getNext();
-            const Record* rec = it->recordFor( loc );
-            BSONObj oldIndexSpec( rec->data() );
+            BSONObj oldIndexSpec = it->dataFor( loc ).toBson();
             if ( fromNS != oldIndexSpec["ns"].valuestrsafe() )
                 continue;
 
@@ -207,7 +207,7 @@ namespace mongo {
                 systemIndexRecordStore->insertRecord( txn,
                                                       newIndexSpec.objdata(),
                                                       newIndexSpec.objsize(),
-                                                      -1 );
+                                                      false );
             if ( !newIndexSpecLoc.isOK() )
                 return newIndexSpecLoc.getStatus();
 
@@ -290,11 +290,10 @@ namespace mongo {
             BSONObj oldSpec;
             {
                 RecordStoreV1Base* rs = _getNamespaceRecordStore();
-                scoped_ptr<RecordIterator> it( rs->getIterator() );
+                scoped_ptr<RecordIterator> it( rs->getIterator(txn) );
                 while ( !it->isEOF() ) {
                     DiskLoc loc = it->getNext();
-                    const Record* rec = it->recordFor( loc );
-                    BSONObj entry( rec->data() );
+                    BSONObj entry = it->dataFor( loc ).toBson();
                     if ( fromNS == entry["name"].String() ) {
                         oldSpecLocation = loc;
                         oldSpec = entry.getOwned();
@@ -446,7 +445,7 @@ namespace mongo {
 
     void MMAPV1DatabaseCatalogEntry::_lazyInit( OperationContext* txn ) {
         // this is sort of insane
-        // it's because the whole structure is highly recursive
+        // it's because the whole storage/mmap_v1 is highly recursive
 
         _namespaceIndex.init( txn );
 
@@ -483,8 +482,8 @@ namespace mongo {
                                                                  &_extentManager,
                                                                  false ) );
 
-            if ( nsEntry->recordStore->storageSize() == 0 )
-                nsEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), -1 );
+            if ( nsEntry->recordStore->storageSize( txn ) == 0 )
+                nsEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), false );
         }
 
         if ( !indexEntry ) {
@@ -499,8 +498,8 @@ namespace mongo {
                                                                     &_extentManager,
                                                                     true ) );
 
-            if ( indexEntry->recordStore->storageSize() == 0 )
-                indexEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), -1 );
+            if ( indexEntry->recordStore->storageSize( txn ) == 0 )
+                indexEntry->recordStore->increaseStorageSize( txn, _extentManager.initialSize( 128 ), false );
         }
 
         if ( isSystemIndexesGoingToBeNew ) {
@@ -567,14 +566,14 @@ namespace mongo {
             if ( options.initialNumExtents > 0 ) {
                 int size = _massageExtentSize( &_extentManager, options.cappedSize );
                 for ( int i = 0; i < options.initialNumExtents; i++ ) {
-                    rs->increaseStorageSize( txn, size, -1 );
+                    rs->increaseStorageSize( txn, size, false );
                 }
             }
             else if ( !options.initialExtentSizes.empty() ) {
                 for ( size_t i = 0; i < options.initialExtentSizes.size(); i++ ) {
                     int size = options.initialExtentSizes[i];
                     size = _massageExtentSize( &_extentManager, size );
-                    rs->increaseStorageSize( txn, size, -1 );
+                    rs->increaseStorageSize( txn, size, false );
                 }
             }
             else if ( options.capped ) {
@@ -583,13 +582,13 @@ namespace mongo {
                     // Must do this at least once, otherwise we leave the collection with no
                     // extents, which is invalid.
                     int sz = _massageExtentSize( &_extentManager,
-                                                 options.cappedSize - rs->storageSize() );
+                                                 options.cappedSize - rs->storageSize(txn) );
                     sz &= 0xffffff00;
-                    rs->increaseStorageSize( txn, sz, -1 );
-                } while( rs->storageSize() < options.cappedSize );
+                    rs->increaseStorageSize( txn, sz, false );
+                } while( rs->storageSize(txn) < options.cappedSize );
             }
             else {
-                rs->increaseStorageSize( txn, _extentManager.initialSize( 128 ), -1 );
+                rs->increaseStorageSize( txn, _extentManager.initialSize( 128 ), false );
             }
         }
 
@@ -597,7 +596,7 @@ namespace mongo {
     }
 
     CollectionCatalogEntry* MMAPV1DatabaseCatalogEntry::getCollectionCatalogEntry( OperationContext* txn,
-                                                                                  const StringData& ns ) {
+                                                                                  const StringData& ns ) const {
         boost::mutex::scoped_lock lk( _collectionsLock );
         CollectionMap::const_iterator i = _collections.find( ns.toString() );
         if ( i == _collections.end() )
@@ -684,13 +683,13 @@ namespace mongo {
             rs = entry->recordStore.get();
         }
 
-        std::auto_ptr<BtreeInterface> btree(
-            BtreeInterface::getInterface(entry->headManager(),
-                                         rs,
-                                         entry->ordering(),
-                                         entry->descriptor()->indexNamespace(),
-                                         entry->descriptor()->version(),
-                                         &BtreeBasedAccessMethod::invalidateCursors));
+        std::auto_ptr<SortedDataInterface> btree(
+            getMMAPV1Interface(entry->headManager(),
+                               rs,
+                               entry->ordering(),
+                               entry->descriptor()->indexNamespace(),
+                               entry->descriptor()->version(),
+                               &BtreeBasedAccessMethod::invalidateCursors));
 
         if (IndexNames::HASHED == type)
             return new HashAccessMethod( entry, btree.release() );
@@ -726,16 +725,16 @@ namespace mongo {
         return entry->recordStore.get();
     }
 
-    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore() {
+    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore() const {
         boost::mutex::scoped_lock lk( _collectionsLock );
         return _getNamespaceRecordStore_inlock();
     }
 
-    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore_inlock() {
+    RecordStoreV1Base* MMAPV1DatabaseCatalogEntry::_getNamespaceRecordStore_inlock() const {
         NamespaceString nss( name(), "system.namespaces" );
-        Entry* entry = _collections[nss.toString()];
-        invariant( entry );
-        return entry->recordStore.get();
+        CollectionMap::const_iterator i = _collections.find( nss.toString() );
+        invariant( i != _collections.end() );
+        return i->second->recordStore.get();
     }
 
     void MMAPV1DatabaseCatalogEntry::_addNamespaceToNamespaceCollection( OperationContext* txn,
@@ -761,7 +760,7 @@ namespace mongo {
 
         RecordStoreV1Base* rs = _getNamespaceRecordStore_inlock();
         invariant( rs );
-        StatusWith<DiskLoc> loc = rs->insertRecord( txn, obj.objdata(), obj.objsize(), -1 );
+        StatusWith<DiskLoc> loc = rs->insertRecord( txn, obj.objdata(), obj.objsize(), false );
         massertStatusOK( loc.getStatus() );
     }
 
@@ -775,11 +774,10 @@ namespace mongo {
         RecordStoreV1Base* rs = _getNamespaceRecordStore();
         invariant( rs );
 
-        scoped_ptr<RecordIterator> it( rs->getIterator() );
+        scoped_ptr<RecordIterator> it( rs->getIterator(txn) );
         while ( !it->isEOF() ) {
             DiskLoc loc = it->getNext();
-            const Record* rec = it->recordFor( loc );
-            BSONObj entry( rec->data() );
+            BSONObj entry = it->dataFor( loc ).toBson();
             BSONElement name = entry["name"];
             if ( name.type() == String && name.String() == ns ) {
                 rs->deleteRecord( txn, loc );
@@ -787,4 +785,32 @@ namespace mongo {
             }
         }
     }
+
+    CollectionOptions MMAPV1DatabaseCatalogEntry::getCollectionOptions( OperationContext* txn,
+                                                                        const StringData& ns ) const {
+        if ( nsToCollectionSubstring( ns ) == "system.namespaces" ) {
+            return CollectionOptions();
+        }
+
+        RecordStoreV1Base* rs = _getNamespaceRecordStore();
+        invariant( rs );
+
+        scoped_ptr<RecordIterator> it( rs->getIterator(txn) );
+        while ( !it->isEOF() ) {
+            DiskLoc loc = it->getNext();
+            BSONObj entry = it->dataFor( loc ).toBson();
+            BSONElement name = entry["name"];
+            if ( name.type() == String && name.String() == ns ) {
+                CollectionOptions options;
+                if ( entry["options"].isABSONObj() ) {
+                    Status status = options.parse( entry["options"].Obj() );
+                    fassert( 18523, status );
+                }
+                return options;
+            }
+        }
+
+        return CollectionOptions();
+    }
+
 }

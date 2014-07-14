@@ -28,7 +28,7 @@
  *    it in the license file.
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include "mongo/db/commands/mr.h"
 
@@ -55,9 +55,12 @@
 #include "mongo/s/d_logic.h"
 #include "mongo/s/grid.h"
 #include "mongo/s/stale_exception.h"
+#include "mongo/util/log.h"
 #include "mongo/util/scopeguard.h"
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kCommands);
 
     namespace mr {
 
@@ -389,6 +392,7 @@ namespace mongo {
                         indexesToInsert.push_back( b.obj() );
                     }
                 }
+                finalCtx.commit();
             }
 
             {
@@ -415,6 +419,7 @@ namespace mongo {
                     string logNs = nsToDatabase( _config.tempNamespace ) + ".system.indexes";
                     repl::logOp(_txn, "i", logNs.c_str(), *it);
                 }
+                tempCtx.commit();
             }
 
         }
@@ -565,9 +570,11 @@ namespace mongo {
                 auto_ptr<DBClientCursor> cursor = _db.query( _config.tempNamespace , BSONObj() );
                 while ( cursor->more() ) {
                     Lock::DBWrite lock(_txn->lockState(), _config.outputOptions.finalNamespace);
+                    WriteUnitOfWork wunit(_txn->recoveryUnit());
                     BSONObj o = cursor->nextSafe();
                     Helpers::upsert( _txn, _config.outputOptions.finalNamespace , o );
                     _txn->recoveryUnit()->commitIfNeeded();
+                    wunit.commit();
                     pm.hit();
                 }
                 _db.dropCollection( _config.tempNamespace );
@@ -583,12 +590,13 @@ namespace mongo {
                 auto_ptr<DBClientCursor> cursor = _db.query( _config.tempNamespace , BSONObj() );
                 while ( cursor->more() ) {
                     Lock::GlobalWrite lock(txn->lockState()); // TODO(erh) why global?
+                    WriteUnitOfWork wunit(txn->recoveryUnit());
                     BSONObj temp = cursor->nextSafe();
                     BSONObj old;
 
                     bool found;
                     {
-                        Client::Context tx( _config.outputOptions.finalNamespace );
+                        Client::Context tx(txn, _config.outputOptions.finalNamespace);
                         Collection* coll =
                             tx.db()->getCollection(_txn, _config.outputOptions.finalNamespace);
                         found = Helpers::findOne(_txn,
@@ -611,6 +619,7 @@ namespace mongo {
                     else {
                         Helpers::upsert( _txn, _config.outputOptions.finalNamespace , temp );
                     }
+                    wunit.commit();
                     _txn->recoveryUnit()->commitIfNeeded();
                     pm.hit();
                 }
@@ -644,6 +653,7 @@ namespace mongo {
 
             coll->insertDocument( _txn, bo, true );
             repl::logOp(_txn, "i", ns.c_str(), bo);
+            ctx.commit();
         }
 
         /**
@@ -660,11 +670,13 @@ namespace mongo {
                                                   " collection expected: " << _config.incLong );
 
             coll->insertDocument( _txn, o, true );
+            ctx.commit();
             _txn->recoveryUnit()->commitIfNeeded();
         }
 
         State::State(OperationContext* txn, const Config& c) :
                 _config(c),
+                _db(txn),
                 _useIncremental(true),
                 _txn(txn),
                 _size(0),
@@ -943,6 +955,7 @@ namespace mongo {
                         break;
                     }
                 }
+                incCtx.commit();
 
                 verify( foundIndex );
             }
@@ -968,7 +981,7 @@ namespace mongo {
                                                 whereCallback).isOK());
 
             Runner* rawRunner;
-            verify(getRunner(ctx->ctx().db()->getCollection(_txn, _config.incLong),
+            verify(getRunner(_txn, ctx->ctx().db()->getCollection(_txn, _config.incLong),
                              cq, &rawRunner, QueryPlannerParams::NO_TABLE_SCAN).isOK());
 
             auto_ptr<Runner> runner(rawRunner);
@@ -1068,6 +1081,7 @@ namespace mongo {
                 return;
 
             Lock::DBWrite kl(_txn->lockState(), _config.incLong);
+            WriteUnitOfWork wunit(_txn->recoveryUnit());
 
             for ( InMemory::iterator i=_temp->begin(); i!=_temp->end(); i++ ) {
                 BSONList& all = i->second;
@@ -1079,6 +1093,7 @@ namespace mongo {
             }
             _temp->clear();
             _size = 0;
+            wunit.commit();
 
         }
 
@@ -1120,7 +1135,9 @@ namespace mongo {
                     // reduce now to lower mem usage
                     Timer t;
                     _scope->invoke(_reduceAll, 0, 0, 0, true);
-                    LOG(1) << "  MR - did reduceAll: keys=" << keyCt << " dups=" << dupCt << " newKeys=" << _scope->getNumberInt("_keyCt") << " time=" << t.millis() << "ms" << endl;
+                    LOG(3) << "  MR - did reduceAll: keys=" << keyCt << " dups=" << dupCt
+                           << " newKeys=" << _scope->getNumberInt("_keyCt") << " time="
+                           << t.millis() << "ms" << endl;
                     return;
                 }
             }
@@ -1133,12 +1150,13 @@ namespace mongo {
                 long oldSize = _size;
                 Timer t;
                 reduceInMemory();
-                LOG(1) << "  MR - did reduceInMemory: size=" << oldSize << " dups=" << _dupCount << " newSize=" << _size << " time=" << t.millis() << "ms" << endl;
+                LOG(3) << "  MR - did reduceInMemory: size=" << oldSize << " dups=" << _dupCount
+                       << " newSize=" << _size << " time=" << t.millis() << "ms" << endl;
 
                 // if size is still high, or values are not reducing well, dump
                 if ( _onDisk && (_size > _config.maxInMemSize || _size > oldSize / 2) ) {
                     dumpToInc();
-                    LOG(1) << "  MR - dumping to db" << endl;
+                    LOG(3) << "  MR - dumping to db" << endl;
                 }
             }
         }
@@ -1186,10 +1204,10 @@ namespace mongo {
         public:
             MapReduceCommand() : Command("mapReduce", false, "mapreduce") {}
 
-            /* why !replset ?
-               bad things happen with --slave (i think because of this)
-            */
-            virtual bool slaveOk() const { return !repl::replSet; }
+            virtual bool slaveOk() const {
+                return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+                        repl::ReplicationCoordinator::modeReplSet;
+            }
 
             virtual bool slaveOverrideOk() const { return true; }
 
@@ -1243,12 +1261,12 @@ namespace mongo {
                     errmsg = "ns doesn't exist";
                     return false;
                 }
-
-                if (repl::replSet && state.isOnDisk()) {
+                repl::ReplicationCoordinator* replCoord = repl::getGlobalReplicationCoordinator();
+                if (replCoord->getReplicationMode() == repl::ReplicationCoordinator::modeReplSet
+                        && state.isOnDisk()) {
                     // this means that it will be doing a write operation, make sure we are on Master
                     // ideally this check should be in slaveOk(), but at that point config is not known
-                    if (!repl::getGlobalReplicationCoordinator()->canAcceptWritesForDatabase(
-                            dbname)) {
+                    if (!replCoord->canAcceptWritesForDatabase(dbname)) {
                         errmsg = "not master";
                         return false;
                     }
@@ -1289,7 +1307,7 @@ namespace mongo {
 
                         // This context does no version check, safe b/c we checked earlier and have an
                         // open cursor
-                        scoped_ptr<Client::Context> ctx(new Client::Context(config.ns, false));
+                        scoped_ptr<Client::Context> ctx(new Client::Context(txn, config.ns, false));
 
                         const NamespaceString nss(config.ns);
                         const WhereCallbackReal whereCallback(nss.db());
@@ -1306,7 +1324,7 @@ namespace mongo {
                         }
 
                         Runner* rawRunner;
-                        if (!getRunner(ctx->db()->getCollection(txn, config.ns), cq, &rawRunner).isOK()) {
+                        if (!getRunner(txn, ctx->db()->getCollection(txn, config.ns), cq, &rawRunner).isOK()) {
                             uasserted(17239, "Can't get runner for query " + config.filter.toString());
                             return 0;
                         }
@@ -1348,7 +1366,8 @@ namespace mongo {
                                 lock.reset();
                                 state.reduceAndSpillInMemoryStateIfNeeded();
                                 lock.reset(new Lock::DBRead(txn->lockState(), config.ns));
-                                ctx.reset(new Client::Context(config.ns, false));
+
+                                ctx.reset(new Client::Context(txn, config.ns, false));
 
                                 reduceTime += t.micros();
 
@@ -1435,7 +1454,10 @@ namespace mongo {
         public:
             void help(stringstream& h) const { h << "internal"; }
             MapReduceFinishCommand() : Command( "mapreduce.shardedfinish" ) {}
-            virtual bool slaveOk() const { return !repl::replSet; }
+            virtual bool slaveOk() const {
+                return repl::getGlobalReplicationCoordinator()->getReplicationMode() !=
+                        repl::ReplicationCoordinator::modeReplSet;
+            }
             virtual bool slaveOverrideOk() const { return true; }
             virtual bool isWriteCommandForConfigServer() const { return false; }
             virtual void addRequiredPrivileges(const std::string& dbname,

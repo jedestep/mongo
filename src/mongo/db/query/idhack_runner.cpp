@@ -1,5 +1,5 @@
 /**
- *    Copyright 2013 MongoDB Inc.
+ *    Copyright 2013-2014 MongoDB Inc.
  *
  *    This program is free software: you can redistribute it and/or  modify
  *    it under the terms of the GNU Affero General Public License, version 3,
@@ -36,7 +36,6 @@
 #include "mongo/db/index/btree_access_method.h"
 #include "mongo/db/index/index_descriptor.h"
 #include "mongo/db/jsobj.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/query/canonical_query.h"
 #include "mongo/db/query/type_explain.h"
 #include "mongo/db/query/plan_executor.h"
@@ -44,8 +43,11 @@
 
 namespace mongo {
 
-    IDHackRunner::IDHackRunner(const Collection* collection, CanonicalQuery* query)
-        : _collection(collection),
+    IDHackRunner::IDHackRunner(OperationContext* txn,
+                               const Collection* collection,
+                               CanonicalQuery* query)
+        : _txn(txn),
+          _collection(collection),
           _key(query->getQueryObj()["_id"].wrap()),
           _query(query),
           _killed(false),
@@ -53,8 +55,9 @@ namespace mongo {
           _nscanned(0),
           _nscannedObjects(0) { }
 
-    IDHackRunner::IDHackRunner(Collection* collection, const BSONObj& key)
-        : _collection(collection),
+    IDHackRunner::IDHackRunner(OperationContext* txn, Collection* collection, const BSONObj& key)
+        : _txn(txn),
+          _collection(collection),
           _key(key),
           _query(NULL),
           _killed(false),
@@ -81,7 +84,7 @@ namespace mongo {
             static_cast<const BtreeBasedAccessMethod*>(catalog->getIndex(idDesc));
 
         // Look up the key by going directly to the Btree.
-        DiskLoc loc = accessMethod->findSingle( _key );
+        DiskLoc loc = accessMethod->findSingle(_txn,  _key );
 
         // Key not found.
         if (loc.isNull()) {
@@ -166,7 +169,7 @@ namespace mongo {
             bob.append(queryObj["_id"]);
             return bob.obj();
         }
-        else if (_query->getProj()->requiresDocument() || _query->getProj()->wantIndexKey()) {
+        else if (_query->getProj()->requiresDocument()) {
             // Not a simple projection, so fallback on the regular projection path.
             BSONObj projectedObj;
             ProjectionExec projExec(projObj,
@@ -239,15 +242,6 @@ namespace mongo {
         }
 
         return Status::OK();
-    }
-
-    // static
-    bool IDHackRunner::supportsQuery(const CanonicalQuery& query) {
-        return !query.getParsed().showDiskLoc()
-            && query.getParsed().getHint().isEmpty()
-            && 0 == query.getParsed().getSkip()
-            && CanonicalQuery::isSimpleIdQuery(query.getParsed().getFilter())
-            && !query.getParsed().hasOption(QueryOption_CursorTailable);
     }
 
     // static

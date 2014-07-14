@@ -33,14 +33,13 @@
 
 #include "mongo/db/db.h"
 #include "mongo/db/json.h"
-#include "mongo/db/pdfile.h"
 #include "mongo/db/ops/insert.h"
 #include "mongo/db/catalog/collection.h"
 #include "mongo/db/storage/mmap_v1/data_file.h"
-#include "mongo/db/storage/extent.h"
-#include "mongo/db/storage/extent_manager.h"
-#include "mongo/db/operation_context_impl.h"
+#include "mongo/db/storage/mmap_v1/extent.h"
+#include "mongo/db/storage/mmap_v1/extent_manager.h"
 #include "mongo/db/storage/mmap_v1/mmap_v1_extent_manager.h"
+#include "mongo/db/operation_context_impl.h"
 #include "mongo/dbtests/dbtests.h"
 
 namespace PdfileTests {
@@ -49,14 +48,15 @@ namespace PdfileTests {
         class Base {
         public:
             Base() : _lk(_txn.lockState()),
-                     _context(ns()) {
-
+            _wunit(_txn.recoveryUnit()),
+                     _context(&_txn, ns()) {
             }
 
             virtual ~Base() {
                 if ( !collection() )
                     return;
                 _context.db()->dropCollection( &_txn, ns() );
+                 _wunit.commit();
             }
 
         protected:
@@ -69,7 +69,7 @@ namespace PdfileTests {
 
             OperationContextImpl _txn;
             Lock::GlobalWrite _lk;
-
+            WriteUnitOfWork _wunit;
             Client::Context _context;
         };
 

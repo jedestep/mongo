@@ -1,7 +1,7 @@
 // @file d_concurrency.h
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -170,7 +170,8 @@ namespace mongo {
 
             void lockTop();
             void lockNestable(Nestable db);
-            void lockOther(const StringData& db);
+            void lockOtherWrite(const StringData& db);
+            void lockOtherRead(const StringData& db);
             void lockDB(const std::string& ns);
             void unlockDB();
 
@@ -179,12 +180,13 @@ namespace mongo {
             void _relock();
 
         public:
-            DBWrite(LockState* lockState, const StringData& dbOrNs);
+            DBWrite(LockState* lockState, const StringData& dbOrNs, bool intentWrite = false);
             virtual ~DBWrite();
 
         private:
             bool _locked_w;
             bool _locked_W;
+            bool _isIntentWrite;
             WrapperForRWLock *_weLocked;
             const std::string _what;
             bool _nested;

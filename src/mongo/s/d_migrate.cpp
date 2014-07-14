@@ -1,7 +1,7 @@
 // d_migrate.cpp
 
 /**
-*    Copyright (C) 2008 10gen Inc.
+*    Copyright (C) 2008-2014 MongoDB Inc.
 *
 *    This program is free software: you can redistribute it and/or  modify
 *    it under the terms of the GNU Affero General Public License, version 3,
@@ -34,7 +34,7 @@
    mostly around shard management and checking
  */
 
-#include "mongo/pch.h"
+#include "mongo/platform/basic.h"
 
 #include <algorithm>
 #include <boost/thread/thread.hpp>
@@ -78,6 +78,7 @@
 #include "mongo/util/elapsed_tracker.h"
 #include "mongo/util/exit.h"
 #include "mongo/util/fail_point_service.h"
+#include "mongo/util/log.h"
 #include "mongo/util/processinfo.h"
 #include "mongo/util/queue.h"
 #include "mongo/util/startup_test.h"
@@ -88,6 +89,8 @@
 using namespace std;
 
 namespace mongo {
+
+    MONGO_LOG_DEFAULT_COMPONENT_FILE(::mongo::logger::LogComponent::kSharding);
 
     MONGO_FP_DECLARE(failMigrationCommit);
     MONGO_FP_DECLARE(failMigrationConfigWritePrepare);
@@ -308,7 +311,7 @@ namespace mongo {
                 break;
 
             case 'u':
-                Client::Context ctx( _ns );
+                Client::Context ctx(txn,  _ns );
                 if ( ! Helpers::findById( txn, ctx.db(), _ns.c_str(), ide.wrap(), it ) ) {
                     warning() << "logOpForSharding couldn't find: " << ide << " even though should have" << migrateLog;
                     return;
@@ -414,7 +417,7 @@ namespace mongo {
             BSONObj min = Helpers::toKeyFormat( kp.extendRangeBound( _min, false ) );
             BSONObj max = Helpers::toKeyFormat( kp.extendRangeBound( _max, false ) );
 
-            auto_ptr<Runner> runner(InternalPlanner::indexScan(collection, idx, min, max, false));
+            auto_ptr<Runner> runner(InternalPlanner::indexScan(txn, collection, idx, min, max, false));
 
             // use the average object size to estimate how many objects a full chunk would carry
             // do that while traversing the chunk's range using the sharding index, below
@@ -1671,6 +1674,7 @@ namespace mongo {
                         db->createCollection( txn, ns );
                     }
                 }
+                ctx.commit();
             }
 
             {                
@@ -1710,6 +1714,7 @@ namespace mongo {
                     // make sure to create index on secondaries as well
                     repl::logOp(txn, "i", db->getSystemIndexesName().c_str(), idx,
                                    NULL, NULL, true /* fromMigrate */);
+                    ctx.commit();
                 }
 
                 timing.done(1);
@@ -1809,6 +1814,7 @@ namespace mongo {
                             }
 
                             Helpers::upsert( txn, ns, o, true );
+                            cx.commit();
                         }
                         thisTime++;
                         numCloned++;
@@ -2046,6 +2052,7 @@ namespace mongo {
                                           true ); /*fromMigrate*/
 
                     *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
+                    cx.commit();
                     didAnything = true;
                 }
             }
@@ -2075,6 +2082,7 @@ namespace mongo {
                     Helpers::upsert( txn, ns , it , true );
 
                     *lastOpApplied = cx.ctx().getClient()->getLastOp().asDate();
+                    cx.commit();
                     didAnything = true;
                 }
             }

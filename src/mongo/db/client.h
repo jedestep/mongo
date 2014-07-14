@@ -59,6 +59,7 @@ namespace mongo {
     class AbstractMessagingPort;
     class LockCollectionForReading;
 
+
     TSP_DECLARE(Client, currentClient)
 
     typedef long long ConnectionId;
@@ -69,11 +70,9 @@ namespace mongo {
         // always be in clientsMutex when manipulating this. killop stuff uses these.
         static std::set<Client*>& clients;
         static mongo::mutex& clientsMutex;
-        static int getActiveClientCount( int& writers , int& readers );
-        class Context;
+
         ~Client();
-        static int recommendedYieldMicros( int * writers = 0 , int * readers = 0,
-                                           bool needExact = false );
+
         /** each thread which does db operations has a Client object in TLS.
          *  call this when your thread starts.
         */
@@ -101,11 +100,10 @@ namespace mongo {
 
         bool isGod() const { return _god; } /* this is for map/reduce writes */
         bool setGod(bool newVal) { const bool prev = _god; _god = newVal; return prev; }
-        std::string toString() const;
         bool gotHandshake( const BSONObj& o );
-        BSONObj getRemoteID() const { return _remoteId; }
-        BSONObj getHandshake() const { return _handshake; }
+        OID getRemoteID() const { return _remoteId; }
         ConnectionId getConnectionId() const { return _connectionId; }
+        const std::string& getThreadId() const { return _threadId; }
 
         // XXX(hk): this is per-thread mmapv1 recovery unit stuff, move into that
         // impl of recovery unit
@@ -130,14 +128,15 @@ namespace mongo {
         std::string _desc;
         bool _god;
         OpTime _lastOp;
-        BSONObj _handshake;
-        BSONObj _remoteId;
+        OID _remoteId;
 
         bool _hasWrittenSinceCheckpoint;
 
         LockState _ls;
         
     public:
+
+        class Context;
 
         /** "read lock, and set my context, all in one operation" 
          *  This handles (if not recursively locked) opening an unopened database.
@@ -156,20 +155,20 @@ namespace mongo {
         /* Set database we want to use, then, restores when we finish (are out of scope)
            Note this is also helpful if an exception happens as the state if fixed up.
         */
-        class Context : boost::noncopyable {
+        class Context {
+            MONGO_DISALLOW_COPYING(Context);
         public:
             /** this is probably what you want */
-            Context(const std::string& ns,
-                    bool doVersion = true);
+            Context(OperationContext* txn, const std::string& ns, bool doVersion = true);
 
             /** note: this does not call finishInit -- i.e., does not call 
                       shardVersionOk() for example. 
                 see also: reset().
             */
-            Context(const std::string& ns , Database * db);
+            Context(OperationContext* txn, const std::string& ns, Database * db);
 
             // used by ReadContext
-            Context(const std::string& ns, Database *db, bool doVersion );
+            Context(OperationContext* txn, const std::string& ns, Database *db, bool doVersion);
 
             ~Context();
             Client* getClient() const { return _client; }
@@ -198,6 +197,7 @@ namespace mongo {
             bool _doVersion;
             const std::string _ns;
             Database * _db;
+            OperationContext* _txn;
             
             Timer _timer;
         }; // class Client::Context
@@ -205,10 +205,15 @@ namespace mongo {
         class WriteContext : boost::noncopyable {
         public:
             WriteContext(OperationContext* opCtx, const std::string& ns, bool doVersion = true);
+
+            /** Commit any writes done so far in this context. */
+            void commit();
+
             Context& ctx() { return _c; }
 
         private:
             Lock::DBWrite _lk;
+            WriteUnitOfWork _wunit;
             Context _c;
         };
 
