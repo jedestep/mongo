@@ -294,18 +294,6 @@ namespace mongo {
                             std::inserter(_filteredScores, _filteredScores.begin()),
                             ScoreMapCompare());
 
-        /*
-        ScoreMap::const_iterator nit = _negScores.begin();
-        for (; nit != _negScores.end(); ++nit) {
-            warning() << "negScores contains " << nit->first << ":" << nit->second << "\n";
-        }
-
-        ScoreMap::const_iterator fit = _filteredScores.begin();
-        for (; fit != _filteredScores.end(); ++fit) {
-            warning() << "filtScores contains " << fit->first << ":" << fit->second << "\n";
-        }
-        */
-
         _negScanners.clear();
         _startedNeg = false;
         _scoreIterator = _filteredScores.begin();
@@ -326,7 +314,9 @@ namespace mongo {
         double score = _scoreIterator->second;
         _scoreIterator++;
 
-        if (_params.query.getPhr().size() > 0) {
+        // Check for positive phrases
+        if (_params.query.getPhr().size() > 0 ||
+            _params.query.getNegatedPhr().size() > 0) {
             if (!_ftsMatcher.phrasesMatch(obj)) {
                 return PlanStage::NEED_TIME;
             }
