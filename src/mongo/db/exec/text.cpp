@@ -184,7 +184,8 @@ namespace mongo {
 
         // Get index scans for negated terms as well.
         std::set<std::string>::const_iterator it;
-        for (it = _params.query.getNegatedTerms().begin(); it != _params.query.getNegatedTerms().end(); ++it) {
+        for (it = _params.query.getNegatedTerms().begin();
+                it != _params.query.getNegatedTerms().end(); ++it) {
             const string& term = *it;
             addScanner(&_negScanners, term);
         }
@@ -287,9 +288,23 @@ namespace mongo {
     }
 
     PlanStage::StageState TextStage::filterNegatives(WorkingSetID* out) {
+        // Get the set difference of positive and negative results.
         std::set_difference(_scores.begin(), _scores.end(),
                             _negScores.begin(), _negScores.end(),
-                            std::inserter(_filteredScores, _filteredScores.begin()));
+                            std::inserter(_filteredScores, _filteredScores.begin()),
+                            ScoreMapCompare());
+
+        /*
+        ScoreMap::const_iterator nit = _negScores.begin();
+        for (; nit != _negScores.end(); ++nit) {
+            warning() << "negScores contains " << nit->first << ":" << nit->second << "\n";
+        }
+
+        ScoreMap::const_iterator fit = _filteredScores.begin();
+        for (; fit != _filteredScores.end(); ++fit) {
+            warning() << "filtScores contains " << fit->first << ":" << fit->second << "\n";
+        }
+        */
 
         _negScanners.clear();
         _startedNeg = false;

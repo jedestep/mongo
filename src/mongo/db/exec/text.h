@@ -124,17 +124,15 @@ namespace mongo {
 
         static const char* kStageType;
     protected:
-        // Comparator class for ScoreMap
-        // Maybe should be in diskloc
+        // Maps from diskloc -> aggregate score for doc.
+        typedef map<DiskLoc, double> ScoreMap;
+        // Comparator class
         class ScoreMapCompare {
             public:
-                bool operator()(const DiskLoc& x, const DiskLoc& y) {
-                    return x < y;
+                bool operator()(std::pair<DiskLoc,double> a, std::pair<DiskLoc,double> b) {
+                    return a.first < b.first;
                 }
         };
-
-        // Maps from diskloc -> aggregate score for doc.
-        typedef map<DiskLoc, double, ScoreMapCompare> ScoreMap;
 
     private:
         /**
