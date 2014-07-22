@@ -330,7 +330,6 @@ namespace mongo {
         double score = _scoreIterator->second;
         _scoreIterator++;
 
-<<<<<<< HEAD
         // If negated terms were present but we opted not to scan
         // (due to threshold constraint), do a manual scan for all
         // negative terms and all phrases.
