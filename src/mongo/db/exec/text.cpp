@@ -207,6 +207,8 @@ namespace mongo {
 
         // Transition to the next state.
         _internalState = READING_TERMS;
+        _curScanner = &_scanners;
+        _curScoreMap = &_scores;
         return PlanStage::NEED_TIME;
     }
 
@@ -276,7 +278,6 @@ namespace mongo {
             if (_startedNegativeScans) {
                 _internalState = FILTER_NEGATIVES;
             }
-
             else {
                 _scoreIterator = _scores.begin();
                 _internalState = RETURNING_RESULTS;
@@ -329,6 +330,7 @@ namespace mongo {
         double score = _scoreIterator->second;
         _scoreIterator++;
 
+<<<<<<< HEAD
         // If negated terms were present but we opted not to scan
         // (due to threshold constraint), do a manual scan for all
         // negative terms and all phrases.
