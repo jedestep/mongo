@@ -54,6 +54,13 @@ namespace mongo {
 
     class OperationContext;
 
+    // The number of positive documents required to do an
+    // additional index scan for negative terms.
+    // If the number of documents is very small, an extra
+    // scan could incur huge additional I/O costs when it would
+    // be simpler to just scan all the documents manually.
+    const int NEGATION_SCAN_THRESHOLD = 10;
+
     struct TextStageParams {
         TextStageParams(const FTSSpec& s) : spec(s) {}
 
@@ -88,13 +95,13 @@ namespace mongo {
             // 2. Read the terms/scores from the text index.
             READING_TERMS,
 
-            // 2.5. If the query had negative terms, remove them.
+            // 3. If the query had negative terms, remove them.
             FILTER_NEGATIVES,
 
-            // 3. Return results to our parent.
+            // 4. Return results to our parent.
             RETURNING_RESULTS,
 
-            // 4. Done.
+            // 5. Done.
             DONE,
         };
 
@@ -129,7 +136,7 @@ namespace mongo {
         // Comparator class
         class ScoreMapCompare {
             public:
-                bool operator()(std::pair<DiskLoc,double> a, std::pair<DiskLoc,double> b) {
+                bool operator()(const std::pair<DiskLoc,double>& a, const std::pair<DiskLoc,double>& b) {
                     return a.first < b.first;
                 }
         };
@@ -149,13 +156,13 @@ namespace mongo {
         /**
          * Helper method to build an index scan and insert it into the given vector.
          */
-        void addScanner(OwnedPointerVector<PlanStage>* vec, const string& term);
+        void addScanner(OwnedPointerVector<PlanStage>* scannerVector, const string& term);
         /**
          * Helper called from readFromSubScanners to update aggregate score with a new-found (term,
          * score) pair for this document.  Also rejects documents that don't match this stage's
          * filter.
          */
-        void addTerm(const BSONObj& key, const DiskLoc& loc, ScoreMap* sm);
+        void addTerm(const BSONObj& key, const DiskLoc& loc, ScoreMap* curMap);
 
         /**
          * Removes any results that were in a negative scan from the result set.
@@ -193,22 +200,23 @@ namespace mongo {
         // Used in INIT_SCANS and READING_TERMS.  The index scans we're using to retrieve text
         // terms.
         OwnedPointerVector<PlanStage> _scanners;
-        OwnedPointerVector<PlanStage> _negScanners;
+        OwnedPointerVector<PlanStage> _negativeScanners;
         OwnedPointerVector<PlanStage>* _curScanner;
 
         // Which _scanners are we currently reading from?
         size_t _currentIndexScanner;
-        bool _startedNeg;
+        bool _startedNegativeScans;
 
         // Temporary score data filled out by sub-scans.  Used in READING_TERMS and
         // RETURNING_RESULTS.
         ScoreMap _scores;
         // In queries with negative terms, we do an index scan for each one 
-        ScoreMap _negScores;
+        ScoreMap _negativeScores;
         // Set difference of pos and neg scores
         ScoreMap _filteredScores;
         ScoreMap* _curScoreMap;
         ScoreMap::const_iterator _scoreIterator;
+
     };
 
 } // namespace mongo

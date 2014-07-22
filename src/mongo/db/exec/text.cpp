@@ -53,7 +53,8 @@ namespace mongo {
           _commonStats(kStageType),
           _internalState(INIT_SCANS),
           _currentIndexScanner(0),
-          _startedNeg(false) {
+          _startedNegativeScans(false) {
+        _curScanner = &_scanners;
         _scoreIterator = _scores.end();
         _specificStats.indexPrefix = _params.indexPrefix;
     }
@@ -173,38 +174,43 @@ namespace mongo {
     }
 
     PlanStage::StageState TextStage::initScans(WorkingSetID* out) {
-        invariant(0 == _scanners.size());
+        invariant(0 == _curScanner->size());
 
         _specificStats.parsedTextQuery = _params.query.toBSON();
 
         // Get all the index scans for each term in our query.
-        for (size_t i = 0; i < _params.query.getTerms().size(); i++) {
-            const string& term = _params.query.getTerms()[i];
-            addScanner(&_scanners, term);
+        if (!_startedNegativeScans) {
+            for (size_t i = 0; i < _params.query.getTerms().size(); i++) {
+                const string& term = _params.query.getTerms()[i];
+                addScanner(&_scanners, term);
+            }
+
+            // If we have no terms we go right to EOF.
+            if (0 == _scanners.size()) {
+                _internalState = DONE;
+                return PlanStage::IS_EOF;
+            }
+
+            _curScanner = &_scanners;
+            _curScoreMap = &_scores;
         }
 
-        // Get index scans for negated terms as well.
-        std::set<std::string>::const_iterator it;
-        for (it = _params.query.getNegatedTerms().begin();
-                it != _params.query.getNegatedTerms().end(); ++it) {
-            const string& term = *it;
-            addScanner(&_negScanners, term);
-        }
-
-        // If we have no terms we go right to EOF.
-        if (0 == _scanners.size()) {
-            _internalState = DONE;
-            return PlanStage::IS_EOF;
+        else {
+            // Get index scans for negated terms as well.
+            std::set<std::string>::const_iterator it;
+            for (it = _params.query.getNegatedTerms().begin();
+                    it != _params.query.getNegatedTerms().end(); ++it) {
+                const string& term = *it;
+                addScanner(&_negativeScanners, term);
+            }
         }
 
         // Transition to the next state.
         _internalState = READING_TERMS;
-        _curScanner = &_scanners;
-        _curScoreMap = &_scores;
         return PlanStage::NEED_TIME;
     }
 
-    void TextStage::addScanner(OwnedPointerVector<PlanStage>* vec, const string& term) {
+    void TextStage::addScanner(OwnedPointerVector<PlanStage>* scannerVector, const string& term) {
         IndexScanParams params;
         params.bounds.startKey = FTSIndexFormat::getIndexKey(MAX_WEIGHT,
                                                              term,
@@ -218,7 +224,7 @@ namespace mongo {
         params.bounds.isSimpleRange = true;
         params.descriptor = _params.index;
         params.direction = -1;
-        vec->mutableVector().push_back(new IndexScan(params, _ws, NULL));
+        scannerVector->mutableVector().push_back(new IndexScan(_txn, params, _ws, NULL));
     }
 
     PlanStage::StageState TextStage::readFromSubScanners(WorkingSetID* out) {
@@ -250,19 +256,27 @@ namespace mongo {
             // Don't need to keep these around.
             _curScanner->clear();
 
-            // If we have negated terms, we need to scan them.
-            if ( !_startedNeg && _negScanners.size() > 0) {
-                _startedNeg = true;
-                _curScanner = &_negScanners;
-                _curScoreMap = &_negScores;
+            // If we have negated terms, we need to scan them unless there
+            // are so few documents that the potential I/O overhead of
+            // an additional scan overwhelms the cost of parsing
+            // all of the documents.
+            if ( !_startedNegativeScans && _negativeScanners.size() > 0
+                 && _curScoreMap->size() >= NEGATION_SCAN_THRESHOLD) {
+                _startedNegativeScans = true;
+                _curScanner = &_negativeScanners;
+                _curScoreMap = &_negativeScores;
                 _currentIndexScanner = 0;
+
+                // Return to INIT_SCANS to set up negative scans.
+                _internalState = INIT_SCANS;
                 return PlanStage::NEED_TIME;
             }
 
             // If we're here we are done reading results.  Move to the next state.
-            if (_params.query.getNegatedTerms().size() > 0) {
+            if (_startedNegativeScans) {
                 _internalState = FILTER_NEGATIVES;
             }
+
             else {
                 _scoreIterator = _scores.begin();
                 _internalState = RETURNING_RESULTS;
@@ -291,12 +305,11 @@ namespace mongo {
     PlanStage::StageState TextStage::filterNegatives(WorkingSetID* out) {
         // Get the set difference of positive and negative results.
         std::set_difference(_scores.begin(), _scores.end(),
-                            _negScores.begin(), _negScores.end(),
+                            _negativeScores.begin(), _negativeScores.end(),
                             std::inserter(_filteredScores, _filteredScores.begin()),
                             ScoreMapCompare());
 
-        _negScanners.clear();
-        _startedNeg = false;
+        _negativeScanners.clear();
         _scoreIterator = _filteredScores.begin();
         _curScoreMap = &_filteredScores;
         _internalState = RETURNING_RESULTS;
@@ -305,6 +318,7 @@ namespace mongo {
 
     PlanStage::StageState TextStage::returnResults(WorkingSetID* out) {
         if (_scoreIterator == _curScoreMap->end()) {
+            _startedNegativeScans = false;
             _internalState = DONE;
             return PlanStage::IS_EOF;
         }
@@ -315,8 +329,18 @@ namespace mongo {
         double score = _scoreIterator->second;
         _scoreIterator++;
 
-        // Check for positive phrases
-        if (_params.query.getPhr().size() > 0 ||
+        // If negated terms were present but we opted not to scan
+        // (due to threshold constraint), do a manual scan for all
+        // negative terms and all phrases.
+        if (!_startedNegativeScans && _params.query.getNegatedTerms().size() > 0) {
+            if (_params.query.hasNonTermPieces()) {
+                if (!_ftsMatcher.matchesNonTerm(obj)) {
+                    return PlanStage::NEED_TIME;
+                }
+            }
+        }
+        // Otherwise, just scan for phrases.
+        else if (_params.query.getPhr().size() > 0 ||
             _params.query.getNegatedPhr().size() > 0) {
             if (!_ftsMatcher.phrasesMatch(obj)) {
                 return PlanStage::NEED_TIME;
@@ -392,10 +416,11 @@ namespace mongo {
         bool* _fetched;
     };
 
-    void TextStage::addTerm(const BSONObj& key, const DiskLoc& loc, ScoreMap* sm) {
-        double *documentAggregateScore = &(*sm)[loc];
+    void TextStage::addTerm(const BSONObj& key, const DiskLoc& loc, ScoreMap* curMap) {
+        double *documentAggregateScore = &(*curMap)[loc];
 
-        if (sm != &_negScores) ++_specificStats.keysExamined;
+        if (curMap != &_negativeScores)
+            ++_specificStats.keysExamined;
 
         // Locate score within possibly compound key: {prefix,term,score,suffix}.
         BSONObjIterator keyIt(key);
@@ -426,7 +451,7 @@ namespace mongo {
 
                 if (!_filter->matches(&tdoc)) {
                     // We had to fetch but we're not going to return it.
-                    if (fetched && sm != &_negScores) {
+                    if (fetched && curMap != &_negativeScores) {
                         ++_specificStats.fetches;
                     }
                     *documentAggregateScore = -1;
@@ -435,7 +460,8 @@ namespace mongo {
             }
             else {
                 // If we're here, we're going to return the doc, and we do a fetch later.
-                if (sm != &_negScores) ++_specificStats.fetches;
+                if (curMap != &_negativeScores)
+                    ++_specificStats.fetches;
             }
         }
 
