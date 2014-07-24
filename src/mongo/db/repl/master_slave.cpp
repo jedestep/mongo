@@ -93,12 +93,12 @@ namespace repl {
     };
 
 
-    ReplSource::ReplSource() {
+    ReplSource::ReplSource(OperationContext* txn) {
         nClonedThisPass = 0;
-        ensureMe();
+        ensureMe(txn);
     }
 
-    ReplSource::ReplSource(BSONObj o) : nClonedThisPass(0) {
+    ReplSource::ReplSource(OperationContext* txn, BSONObj o) : nClonedThisPass(0) {
         only = o.getStringField("only");
         hostName = o.getStringField("host");
         _sourceName = o.getStringField("source");
@@ -132,7 +132,7 @@ namespace repl {
                 incompleteCloneDbs.insert( e.fieldName() );
             }
         }
-        ensureMe();
+        ensureMe(txn);
     }
 
     /* Turn our C++ Source object into a BSONObj */
@@ -166,31 +166,31 @@ namespace repl {
         return b.obj();
     }
 
-    void ReplSource::ensureMe() {
+    void ReplSource::ensureMe(OperationContext* txn) {
         string myname = getHostName();
+        bool exists = false;
         {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, "local");
+            Client::ReadContext ctx(txn, "local");
             // local.me is an identifier for a server for getLastError w:2+
-            if (!Helpers::getSingleton(&txn, "local.me", _me) ||
-                !_me.hasField("host") ||
-                _me["host"].String() != myname) {
+            exists = Helpers::getSingleton(txn, "local.me", _me);
+        }
+        if (!exists || !_me.hasField("host") || _me["host"].String() != myname) {
+            Client::WriteContext ctx(txn, "local");
+            // clean out local.me
+            Helpers::emptyCollection(txn, "local.me");
 
-                // clean out local.me
-                Helpers::emptyCollection(&txn, "local.me");
-
-                // repopulate
-                BSONObjBuilder b;
-                b.appendOID("_id", 0, true);
-                b.append("host", myname);
-                _me = b.obj();
-                Helpers::putSingleton(&txn, "local.me", _me);
-            }
+            // repopulate
+            BSONObjBuilder b;
+            b.appendOID("_id", 0, true);
+            b.append("host", myname);
+            _me = b.obj();
+            Helpers::putSingleton(txn, "local.me", _me);
             ctx.commit();
         }
+        _me = _me.getOwned();
     }
 
-    void ReplSource::save() {
+    void ReplSource::save(OperationContext* txn) {
         BSONObjBuilder b;
         verify( !hostName.empty() );
         b.append("host", hostName);
@@ -203,26 +203,28 @@ namespace repl {
         LOG( 1 ) << "Saving repl source: " << o << endl;
 
         {
-            OperationContextImpl txn;
             OpDebug debug;
 
-            Client::Context ctx(&txn, "local.sources");
+            Client::Context ctx(txn, "local.sources");
 
             const NamespaceString requestNs("local.sources");
-            UpdateRequest request(requestNs);
+            UpdateRequest request(txn, requestNs);
 
             request.setQuery(pattern);
             request.setUpdates(o);
             request.setUpsert();
 
-            UpdateResult res = update(&txn, ctx.db(), request, &debug);
+            UpdateResult res = update(ctx.db(), request, &debug);
 
             verify( ! res.modifiers );
             verify( res.numMatched == 1 );
         }
     }
 
-    static void addSourceToList(ReplSource::SourceVector &v, ReplSource& s, ReplSource::SourceVector &old) {
+    static void addSourceToList(OperationContext* txn,
+                                ReplSource::SourceVector &v,
+                                ReplSource& s,
+                                ReplSource::SourceVector &old) {
         if ( !s.syncedTo.isNull() ) { // Don't reuse old ReplSource if there was a forced resync.
             for ( ReplSource::SourceVector::iterator i = old.begin(); i != old.end();  ) {
                 if ( s == **i ) {
@@ -252,15 +254,15 @@ namespace repl {
             // check that no items are in sources other than that
             // add if missing
             int n = 0;
-            auto_ptr<Runner> runner(
+            auto_ptr<PlanExecutor> exec(
                 InternalPlanner::collectionScan(txn,
                                                 localSources,
                                                 ctx.db()->getCollection(txn, localSources)));
             BSONObj obj;
-            Runner::RunnerState state;
-            while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
+            PlanExecutor::ExecState state;
+            while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
                 n++;
-                ReplSource tmp(obj);
+                ReplSource tmp(txn, obj);
                 if (tmp.hostName != replSettings.source) {
                     log() << "repl: --source " << replSettings.source << " != " << tmp.hostName
                           << " from local.sources collection" << endl;
@@ -278,14 +280,14 @@ namespace repl {
                     dbexit( EXIT_REPLICATION_ERROR );
                 }
             }
-            uassert(17065, "Internal error reading from local.sources", Runner::RUNNER_EOF == state);
+            uassert(17065, "Internal error reading from local.sources", PlanExecutor::IS_EOF == state);
             uassert( 10002 ,  "local.sources collection corrupt?", n<2 );
             if ( n == 0 ) {
                 // source missing.  add.
-                ReplSource s;
+                ReplSource s(txn);
                 s.hostName = replSettings.source;
                 s.only = replSettings.only;
-                s.save();
+                s.save(txn);
             }
         }
         else {
@@ -297,14 +299,14 @@ namespace repl {
             }
         }
 
-        auto_ptr<Runner> runner(
+        auto_ptr<PlanExecutor> exec(
             InternalPlanner::collectionScan(txn,
                                             localSources,
                                             ctx.db()->getCollection(txn, localSources)));
         BSONObj obj;
-        Runner::RunnerState state;
-        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(&obj, NULL))) {
-            ReplSource tmp(obj);
+        PlanExecutor::ExecState state;
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(&obj, NULL))) {
+            ReplSource tmp(txn, obj);
             if ( tmp.syncedTo.isNull() ) {
                 DBDirectClient c(txn);
                 if ( c.exists( "local.oplog.$main" ) ) {
@@ -314,9 +316,9 @@ namespace repl {
                     }
                 }
             }
-            addSourceToList(v, tmp, old);
+            addSourceToList(txn, v, tmp, old);
         }
-        uassert(17066, "Internal error reading from local.sources", Runner::RUNNER_EOF == state);
+        uassert(17066, "Internal error reading from local.sources", PlanExecutor::IS_EOF == state);
     }
 
     bool ReplSource::throttledForceResyncDead( OperationContext* txn, const char *requester ) {
@@ -347,7 +349,7 @@ namespace repl {
             invariant(txn->lockState()->isW());
             Lock::TempRelease tempRelease(txn->lockState());
 
-            if (!oplogReader.connect(hostName, _me)) {
+            if (!oplogReader.connect(hostName, getGlobalReplicationCoordinator()->getMyRID(txn))) {
                 msgassertedNoTrace( 14051 , "unable to connect to resync");
             }
             /* todo use getDatabaseNames() method here */
@@ -370,7 +372,7 @@ namespace repl {
         }
         syncedTo = OpTime();
         addDbNextPass.clear();
-        save();
+        save(txn);
     }
 
     void ReplSource::resyncDrop( OperationContext* txn, const string& db ) {
@@ -673,14 +675,14 @@ namespace repl {
                 if ( incompleteClone ) {
                     log() << "An earlier initial clone of '" << clientName << "' did not complete, now resyncing." << endl;
                 }
-                save();
+                save(txn);
                 Client::Context ctx(txn, ns);
                 nClonedThisPass++;
                 resync(txn, ctx.db()->name());
                 addDbNextPass.erase(clientName);
                 incompleteCloneDbs.erase( clientName );
             }
-            save();
+            save(txn);
         }
         else {
             applyOperation(txn, ctx.db(), op);
@@ -788,7 +790,7 @@ namespace repl {
                 // obviously global isn't ideal, but non-repl set is old so 
                 // keeping it simple
                 Lock::GlobalWrite lk(txn->lockState());
-                save();
+                save(txn);
             }
 
             BSONObjBuilder gte;
@@ -840,7 +842,7 @@ namespace repl {
             }
             {
                 Lock::GlobalWrite lk(txn->lockState());
-                save();
+                save(txn);
             }
             return okResultCode;
         }
@@ -918,7 +920,7 @@ namespace repl {
                     }
 
                     syncedTo = nextOpTime;
-                    save(); // note how far we are synced up to now
+                    save(txn); // note how far we are synced up to now
                     log() << "repl:   applied " << n << " operations" << endl;
                     nApplied = n;
                     log() << "repl:  end sync_pullOpLog syncedTo: " << syncedTo.toStringLong() << endl;
@@ -930,7 +932,7 @@ namespace repl {
                     Lock::GlobalWrite lk(txn->lockState());
                     syncedTo = nextOpTime;
                     // can't update local log ts since there are pending operations from our peer
-                    save();
+                    save(txn);
                     log() << "repl:   checkpoint applied " << n << " operations" << endl;
                     log() << "repl:   syncedTo: " << syncedTo.toStringLong() << endl;
                     saveLast = time(0);
@@ -971,7 +973,7 @@ namespace repl {
                         Lock::GlobalWrite lk(txn->lockState());
                         if ( n > 0 ) {
                             syncedTo = last;
-                            save();
+                            save(txn);
                         }
                         log() << "repl:   applied " << n << " operations" << endl;
                         log() << "repl:   syncedTo: " << syncedTo.toStringLong() << endl;
@@ -1004,7 +1006,7 @@ namespace repl {
        returns >= 0 if ok.  return -1 if you want to reconnect.
        return value of zero indicates no sleep necessary before next call
     */
-    int ReplSource::sync(int& nApplied) {
+    int ReplSource::sync(OperationContext* txn, int& nApplied) {
         _sleepAdviceTime = 0;
         ReplInfo r("sync");
         if (!serverGlobalParams.quiet) {
@@ -1025,13 +1027,12 @@ namespace repl {
             return -1;
         }
 
-        if ( !oplogReader.connect(hostName, _me) ) {
+        if ( !oplogReader.connect(hostName, getGlobalReplicationCoordinator()->getMyRID(txn)) ) {
             LOG(4) << "repl:  can't connect to sync source" << endl;
             return -1;
         }
 
-        OperationContextImpl txn; // XXX?
-        return _sync_pullOpLog(&txn, nApplied);
+        return _sync_pullOpLog(txn, nApplied);
     }
 
     /* --------------------------------------------------------------*/
@@ -1046,12 +1047,11 @@ namespace repl {
                 0 = no sleep recommended
                 1 = special sentinel indicating adaptive sleep recommended
     */
-    int _replMain(ReplSource::SourceVector& sources, int& nApplied) {
-        OperationContextImpl txn;
+    int _replMain(OperationContext* txn, ReplSource::SourceVector& sources, int& nApplied) {
         {
             ReplInfo r("replMain load sources");
-            Lock::GlobalWrite lk(txn.lockState());
-            ReplSource::loadAll(&txn, sources);
+            Lock::GlobalWrite lk(txn->lockState());
+            ReplSource::loadAll(txn, sources);
 
             // only need this param for initial reset
             getGlobalReplicationCoordinator()->getSettings().fastsync = false;
@@ -1070,7 +1070,7 @@ namespace repl {
             ReplSource *s = i->get();
             int res = -1;
             try {
-                res = s->sync(nApplied);
+                res = s->sync(txn, nApplied);
                 bool moreToSync = s->haveMoreDbsToSync();
                 if( res < 0 ) {
                     sleepAdvice = 3;
@@ -1116,17 +1116,16 @@ namespace repl {
         return sleepAdvice;
     }
 
-    static void replMain() {
+    static void replMain(OperationContext* txn) {
         ReplSource::SourceVector sources;
         while ( 1 ) {
             int s = 0;
             {
-                OperationContextImpl txn;
-                Lock::GlobalWrite lk(txn.lockState());
+                Lock::GlobalWrite lk(txn->lockState());
                 if ( replAllDead ) {
                     // throttledForceResyncDead can throw
                     if ( !getGlobalReplicationCoordinator()->getSettings().autoresync ||
-                            !ReplSource::throttledForceResyncDead( &txn, "auto" ) ) {
+                            !ReplSource::throttledForceResyncDead( txn, "auto" ) ) {
                         log() << "all sources dead: " << replAllDead << ", sleeping for 5 seconds" << endl;
                         break;
                     }
@@ -1137,7 +1136,7 @@ namespace repl {
 
             try {
                 int nApplied = 0;
-                s = _replMain(sources, nApplied);
+                s = _replMain(txn, sources, nApplied);
                 if( s == 1 ) {
                     if( nApplied == 0 ) s = 2;
                     else if( nApplied > 100 ) {
@@ -1153,8 +1152,7 @@ namespace repl {
             }
 
             {
-                LockState lockState;
-                Lock::GlobalWrite lk(&lockState);
+                Lock::GlobalWrite lk(txn->lockState());
                 verify( syncing == 1 );
                 syncing--;
             }
@@ -1214,15 +1212,16 @@ namespace repl {
         sleepsecs(1);
         Client::initThread("replslave");
 
+        OperationContextImpl txn;
+
         {
-            LockState lockState;
-            Lock::GlobalWrite lk(&lockState);
+            Lock::GlobalWrite lk(txn.lockState());
             replLocalAuth();
         }
 
         while ( 1 ) {
             try {
-                replMain();
+                replMain(&txn);
                 sleepsecs(5);
             }
             catch ( AssertionException& ) {
@@ -1243,6 +1242,7 @@ namespace repl {
     }
 
     void startMasterSlave() {
+        OperationContextImpl txn;
 
         oldRepl();
 
@@ -1251,9 +1251,12 @@ namespace repl {
             return;
 
         {
-            LockState lockState;
-            Lock::GlobalWrite lk(&lockState);
+            Lock::GlobalWrite lk(txn.lockState());
             replLocalAuth();
+        }
+
+        {
+            ReplSource temp(&txn); // Ensures local.me is populated
         }
 
         if ( replSettings.slave ) {
@@ -1265,7 +1268,7 @@ namespace repl {
         if ( replSettings.master ) {
             LOG(1) << "master=true" << endl;
             replSettings.master = true;
-            createOplog();
+            createOplog(&txn);
             boost::thread t(replMasterThread);
         }
 

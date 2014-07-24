@@ -36,7 +36,7 @@
 #include "mongo/db/curop.h"
 #include "mongo/db/ops/delete_request.h"
 #include "mongo/db/query/canonical_query.h"
-#include "mongo/db/query/get_runner.h"
+#include "mongo/db/query/get_executor.h"
 #include "mongo/db/query/lite_parsed_query.h"
 #include "mongo/db/query/query_planner_common.h"
 #include "mongo/db/repl/repl_coordinator_global.h"
@@ -66,7 +66,8 @@ namespace mongo {
         }
 
         CanonicalQuery* cqRaw;
-        const WhereCallbackReal whereCallback(_request->getNamespaceString().db());
+        const WhereCallbackReal whereCallback(
+                                    _request->getOpCtx(), _request->getNamespaceString().db());
 
         Status status = CanonicalQuery::canonicalize(_request->getNamespaceString().ns(),
                                                      _request->getQuery(),
@@ -80,7 +81,7 @@ namespace mongo {
         return status;
     }
 
-    long long DeleteExecutor::execute(OperationContext* txn, Database* db) {
+    long long DeleteExecutor::execute(Database* db) {
         uassertStatusOK(prepare());
         uassert(17417,
                 mongoutils::str::stream() <<
@@ -100,7 +101,7 @@ namespace mongo {
             }
         }
 
-        Collection* collection = db->getCollection(txn, ns.ns());
+        Collection* collection = db->getCollection(_request->getOpCtx(), ns.ns());
         if (NULL == collection) {
             return 0;
         }
@@ -116,28 +117,31 @@ namespace mongo {
 
         long long nDeleted = 0;
 
-        Runner* rawRunner;
+        PlanExecutor* rawExec;
         if (_canonicalQuery.get()) {
-            uassertStatusOK(getRunner(txn, collection, _canonicalQuery.release(), &rawRunner));
+            uassertStatusOK(getExecutor(_request->getOpCtx(),
+                                        collection,
+                                        _canonicalQuery.release(),
+                                        &rawExec));
         }
         else {
-            CanonicalQuery* ignored;
-            uassertStatusOK(getRunner(txn,
-                                      collection,
-                                      ns.ns(),
-                                      _request->getQuery(),
-                                      &rawRunner,
-                                      &ignored));
+            uassertStatusOK(getExecutor(_request->getOpCtx(),
+                                        collection,
+                                        ns.ns(),
+                                        _request->getQuery(),
+                                        &rawExec));
         }
 
-        auto_ptr<Runner> runner(rawRunner);
-        ScopedRunnerRegistration safety(runner.get());
+        auto_ptr<PlanExecutor> exec(rawExec);
+
+        // Concurrently mutating state (by us) so we need to register 'exec'.
+        ScopedExecutorRegistration safety(exec.get());
 
         DiskLoc rloc;
-        Runner::RunnerState state;
-        CurOp* curOp = txn->getCurOp();
+        PlanExecutor::ExecState state;
+        CurOp* curOp = _request->getOpCtx()->getCurOp();
         int oldYieldCount = curOp->numYields();
-        while (Runner::RUNNER_ADVANCED == (state = runner->getNext(NULL, &rloc))) {
+        while (PlanExecutor::ADVANCED == (state = exec->getNext(NULL, &rloc))) {
             if (oldYieldCount != curOp->numYields()) {
                 uassert(ErrorCodes::NotMaster,
                         str::stream() << "No longer primary while removing from " << ns.ns(),
@@ -150,9 +154,10 @@ namespace mongo {
 
             // TODO: do we want to buffer docs and delete them in a group rather than
             // saving/restoring state repeatedly?
-            runner->saveState();
-            collection->deleteDocument(txn, rloc, false, false, logop ? &toDelete : NULL );
-            runner->restoreState(txn);
+            exec->saveState();
+            collection->deleteDocument(
+                            _request->getOpCtx(), rloc, false, false, logop ? &toDelete : NULL);
+            exec->restoreState(_request->getOpCtx());
 
             nDeleted++;
 
@@ -163,7 +168,8 @@ namespace mongo {
                 }
                 else {
                     bool replJustOne = true;
-                    repl::logOp(txn, "d", ns.ns().c_str(), toDelete, 0, &replJustOne);
+                    repl::logOp(
+                            _request->getOpCtx(), "d", ns.ns().c_str(), toDelete, 0, &replJustOne);
                 }
             }
 
@@ -172,7 +178,7 @@ namespace mongo {
             }
 
             if (!_request->isGod()) {
-                txn->recoveryUnit()->commitIfNeeded();
+                _request->getOpCtx()->recoveryUnit()->commitIfNeeded();
             }
 
             if (debug && _request->isGod() && nDeleted == 100) {

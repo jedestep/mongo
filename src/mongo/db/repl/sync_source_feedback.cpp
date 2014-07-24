@@ -37,9 +37,11 @@
 #include "mongo/db/auth/authorization_session.h"
 #include "mongo/db/auth/security_key.h"
 #include "mongo/db/dbhelpers.h"
-#include "mongo/db/repl/bgsync.h"
-#include "mongo/db/repl/rs.h"  // theReplSet
 #include "mongo/db/operation_context_impl.h"
+#include "mongo/db/repl/bgsync.h"
+#include "mongo/db/repl/repl_coordinator_global.h"
+#include "mongo/db/repl/rs.h"  // theReplSet
+#include "mongo/db/operation_context.h"
 #include "mongo/util/log.h"
 
 namespace mongo {
@@ -51,15 +53,6 @@ namespace repl {
     // used in replAuthenticate
     static const BSONObj userReplQuery = fromjson("{\"user\":\"repl\"}");
 
-    void SyncSourceFeedback::associateMember(const OID& rid, Member* member) {
-        invariant(member);
-        LOG(2) << "Associating RID " << rid << " with member: " << member->fullName();
-        boost::unique_lock<boost::mutex> lock(_mtx);
-        _handshakeNeeded = true;
-        _members[rid] = member;
-        _cond.notify_all();
-    }
-
     bool SyncSourceFeedback::replAuthenticate() {
         if (!getGlobalAuthorizationManager()->isAuthEnabled())
             return true;
@@ -69,26 +62,25 @@ namespace repl {
         return authenticateInternalUser(_connection.get());
     }
 
-    void SyncSourceFeedback::ensureMe() {
+    void SyncSourceFeedback::ensureMe(OperationContext* txn) {
         string myname = getHostName();
         {
-            OperationContextImpl txn;
-            Client::WriteContext ctx(&txn, "local");
+            Client::WriteContext ctx(txn, "local");
 
             // local.me is an identifier for a server for getLastError w:2+
-            if (!Helpers::getSingleton(&txn, "local.me", _me) ||
+            if (!Helpers::getSingleton(txn, "local.me", _me) ||
                 !_me.hasField("host") ||
                 _me["host"].String() != myname) {
 
                 // clean out local.me
-                Helpers::emptyCollection(&txn, "local.me");
+                Helpers::emptyCollection(txn, "local.me");
 
                 // repopulate
                 BSONObjBuilder b;
                 b.appendOID("_id", 0, true);
                 b.append("host", myname);
                 _me = b.obj();
-                Helpers::putSingleton(&txn, "local.me", _me);
+                Helpers::putSingleton(txn, "local.me", _me);
             }
             ctx.commit();
             // _me is used outside of a read lock, so we must copy it out of the mmap
@@ -96,37 +88,12 @@ namespace repl {
         }
     }
 
-    bool SyncSourceFeedback::replHandshake() {
+    bool SyncSourceFeedback::replHandshake(OperationContext* txn) {
         // construct a vector of handshake obj for us as well as all chained members
         std::vector<BSONObj> handshakeObjs;
-        {
-            boost::unique_lock<boost::mutex> lock(_mtx);
-            // handshake obj for us
-            BSONObjBuilder cmd;
-            cmd.append("replSetUpdatePosition", 1);
-            BSONObjBuilder sub (cmd.subobjStart("handshake"));
-            sub.appendAs(_me["_id"], "handshake");
-            sub.append("member", theReplSet->selfId());
-            sub.append("config", theReplSet->myConfig().asBson());
-            sub.doneFast();
-            handshakeObjs.push_back(cmd.obj());
-
-            // handshake objs for all chained members
-            for (OIDMemberMap::iterator itr = _members.begin();
-                 itr != _members.end(); ++itr) {
-                BSONObjBuilder cmd;
-                cmd.append("replSetUpdatePosition", 1);
-                // outer handshake indicates this is a handshake command
-                // inner is needed as part of the structure to be passed to gotHandshake
-                BSONObjBuilder subCmd (cmd.subobjStart("handshake"));
-                subCmd.append("handshake", itr->first);
-                subCmd.append("member", itr->second->id());
-                subCmd.append("config", itr->second->config().asBson());
-                subCmd.doneFast();
-                handshakeObjs.push_back(cmd.obj());
-            }
-        }
-
+        getGlobalReplicationCoordinator()->prepareReplSetUpdatePositionCommandHandshakes(
+                txn,
+                &handshakeObjs);
         LOG(1) << "handshaking upstream updater";
         for (std::vector<BSONObj>::iterator it = handshakeObjs.begin();
                 it != handshakeObjs.end();
@@ -155,7 +122,7 @@ namespace repl {
         return true;
     }
 
-    bool SyncSourceFeedback::_connect(const std::string& hostName) {
+    bool SyncSourceFeedback::_connect(OperationContext* txn, const std::string& hostName) {
         if (hasConnection()) {
             return true;
         }
@@ -169,7 +136,7 @@ namespace repl {
             return false;
         }
 
-        replHandshake();
+        replHandshake(txn);
         return hasConnection();
     }
 
@@ -179,49 +146,27 @@ namespace repl {
         _cond.notify_all();
     }
 
-    void SyncSourceFeedback::updateMap(const mongo::OID& rid, const OpTime& ot) {
+    void SyncSourceFeedback::forwardSlaveProgress() {
         boost::unique_lock<boost::mutex> lock(_mtx);
-        // only update if ot is newer than what we have already
-        if (ot > _slaveMap[rid]) {
-            _slaveMap[rid] = ot;
-            _positionChanged = true;
-            LOG(2) << "Updating our knowledge of the replication progress for node with RID " <<
-                    rid << " to be at optime " << ot;
-            _cond.notify_all();
-        }
+        _positionChanged = true;
+        _cond.notify_all();
     }
 
-    bool SyncSourceFeedback::updateUpstream() {
-        if (theReplSet->isPrimary()) {
+    bool SyncSourceFeedback::updateUpstream(OperationContext* txn) {
+        ReplicationCoordinator* replCoord = getGlobalReplicationCoordinator();
+        if (replCoord->getCurrentMemberState().primary()) {
             // primary has no one to update to
             return true;
         }
         BSONObjBuilder cmd;
-        cmd.append("replSetUpdatePosition", 1);
-        // create an array containing objects each member connected to us and for ourself
-        BSONArrayBuilder array (cmd.subarrayStart("optimes"));
-        OID myID = _me["_id"].OID();
         {
             boost::unique_lock<boost::mutex> lock(_mtx);
             if (_handshakeNeeded) {
                 // Don't send updates if there are nodes that haven't yet been handshaked
                 return false;
             }
-            for (map<mongo::OID, OpTime>::const_iterator itr = _slaveMap.begin();
-                    itr != _slaveMap.end(); ++itr) {
-                BSONObjBuilder entry(array.subobjStart());
-                entry.append("_id", itr->first);
-                entry.append("optime", itr->second);
-                if (itr->first == myID) {
-                    entry.append("config", theReplSet->myConfig().asBson());
-                }
-                else {
-                    entry.append("config", _members[itr->first]->config().asBson());
-                }
-                entry.doneFast();
-            }
+            replCoord->prepareReplSetUpdatePositionCommand(txn, &cmd);
         }
-        array.done();
         BSONObj res;
 
         LOG(2) << "Sending slave oplog progress to upstream updater: " << cmd.done();
@@ -244,6 +189,8 @@ namespace repl {
 
     void SyncSourceFeedback::run() {
         Client::initThread("SyncSourceFeedbackThread");
+        OperationContextImpl txn;
+
         bool sleepNeeded = false;
         bool positionChanged = false;
         bool handshakeNeeded = false;
@@ -282,20 +229,20 @@ namespace repl {
                     sleepNeeded = true;
                     continue;
                 }
-                if (!_connect(target->fullName())) {
+                if (!_connect(&txn, target->fullName())) {
                     sleepNeeded = true;
                     continue;
                 }
             }
             if (handshakeNeeded) {
-                if (!replHandshake()) {
+                if (!replHandshake(&txn)) {
                     boost::unique_lock<boost::mutex> lock(_mtx);
                     _handshakeNeeded = true;
                     continue;
                 }
             }
             if (positionChanged) {
-                if (!updateUpstream()) {
+                if (!updateUpstream(&txn)) {
                     boost::unique_lock<boost::mutex> lock(_mtx);
                     _positionChanged = true;
                 }

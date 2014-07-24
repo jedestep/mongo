@@ -117,11 +117,11 @@ namespace mongo {
         }
     }
 
-    void TextStage::recoverFromYield() {
+    void TextStage::recoverFromYield(OperationContext* opCtx) {
         ++_commonStats.unyields;
 
         for (size_t i = 0; i < _scanners.size(); ++i) {
-            _scanners.mutableVector()[i]->recoverFromYield();
+            _scanners.mutableVector()[i]->recoverFromYield(opCtx);
         }
     }
 

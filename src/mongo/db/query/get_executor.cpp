@@ -93,7 +93,7 @@ namespace mongo {
     }
 
     namespace {
-        // The body is below in the "count hack" section but getRunner calls it.
+        // The body is below in the "count hack" section but getExecutor calls it.
         bool turnIxscanIntoCount(QuerySolution* soln);
     }  // namespace
 
@@ -174,14 +174,14 @@ namespace mongo {
                    << " Using EOF stage: " << unparsedQuery.toString();
             EOFStage* eofStage = new EOFStage();
             WorkingSet* ws = new WorkingSet();
-            *out = new PlanExecutor(ws, eofStage, collection);
+            *out = new PlanExecutor(ws, eofStage, ns);
             return Status::OK();
         }
 
         if (!CanonicalQuery::isSimpleIdQuery(unparsedQuery) ||
             !collection->getIndexCatalog()->findIdIndex()) {
 
-            const WhereCallbackReal whereCallback(collection->ns().db());
+            const WhereCallbackReal whereCallback(txn, collection->ns().db());
             CanonicalQuery* cq;
             Status status = CanonicalQuery::canonicalize(
                         collection->ns(), unparsedQuery, &cq, whereCallback);
@@ -230,7 +230,7 @@ namespace mongo {
         // so we don't support covered projections. However, we might use the simple inclusion
         // fast path.
         if (NULL != canonicalQuery->getProj()) {
-            ProjectionStageParams params(WhereCallbackReal(collection->ns().db()));
+            ProjectionStageParams params(WhereCallbackReal(txn, collection->ns().db()));
             params.projObj = canonicalQuery->getProj()->getProjObj();
 
             // Stuff the right data into the params depending on what proj impl we use.
@@ -262,7 +262,7 @@ namespace mongo {
         if (NULL == collection) {
             const string& ns = canonicalQuery->ns();
             LOG(2) << "Collection " << ns << " does not exist."
-                   << " Using EOF runner: " << canonicalQuery->toStringShort();
+                   << " Using EOF plan: " << canonicalQuery->toStringShort();
             EOFStage* eofStage = new EOFStage();
             WorkingSet* ws = new WorkingSet();
             *out = new PlanExecutor(ws, eofStage, canonicalQuery.release(), collection);
@@ -274,7 +274,7 @@ namespace mongo {
         plannerParams.options = plannerOptions;
         fillOutPlannerParams(collection, canonicalQuery.get(), &plannerParams);
 
-        // If we have an _id index we can use the idhack runner.
+        // If we have an _id index we can use an idhack plan.
         if (IDHackStage::supportsQuery(*canonicalQuery.get()) &&
             collection->getIndexCatalog()->findIdIndex()) {
             return getExecutorIDHack(txn, collection, canonicalQuery.release(), plannerParams, out);
@@ -312,9 +312,8 @@ namespace mongo {
                                                         &qs, &backupQs);
 
             if (status.isOK()) {
-                // the working set will be shared by the root and backupRoot plans
-                // and owned by the containing single-solution-runner
-                //
+                // The working set will be shared by the root and backupRoot plans
+                // and owned by the containing PlanExecutor.
                 WorkingSet* sharedWs = new WorkingSet();
 
                 PlanStage *root, *backupRoot=NULL;
@@ -437,9 +436,9 @@ namespace mongo {
             return Status::OK();
         }
         else {
-            // Many solutions.  Create a MultiPlanStage to pick the best, update the cache, and so on.
-
-            // The working set will be shared by all candidate plans and owned by the containing runner
+            // Many solutions. Create a MultiPlanStage to pick the best, update the cache,
+            // and so on. The working set will be shared by all candidate plans and owned by
+            // the containing PlanExecutor.
             WorkingSet* sharedWorkingSet = new WorkingSet();
 
             MultiPlanStage* multiPlanStage = new MultiPlanStage(collection, canonicalQuery.get());
@@ -622,7 +621,7 @@ namespace mongo {
          *    the projected field will be the prefix of the field up to the array element.
          *    For example, a.b.2 => {_id: 0, 'a.b': 1}
          *    Note that we can't use a $slice projection because the distinct command filters
-         *    the results from the runner using the dotted field name. Using $slice will
+         *    the results from the executor using the dotted field name. Using $slice will
          *    re-order the documents in the array in the results.
          */
         BSONObj getDistinctProjection(const std::string& field) {
@@ -652,7 +651,7 @@ namespace mongo {
                             PlanExecutor** execOut) {
         invariant(collection);
 
-        const WhereCallbackReal whereCallback(collection->ns().db());
+        const WhereCallbackReal whereCallback(txn, collection->ns().db());
 
         CanonicalQuery* cq;
         uassertStatusOK(CanonicalQuery::canonicalize(collection->ns().ns(),
@@ -759,7 +758,7 @@ namespace mongo {
             }
         }
 
-        const WhereCallbackReal whereCallback(collection->ns().db());
+        const WhereCallbackReal whereCallback(txn, collection->ns().db());
 
         // If there are no suitable indices for the distinct hack bail out now into regular planning
         // with no projection.
