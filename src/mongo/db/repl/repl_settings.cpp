@@ -26,39 +26,22 @@
  *    it in the license file.
  */
 
-#include "mongo/db/storage/recovery_unit.h"
+#include "mongo/db/repl/repl_settings.h"
+
+#include "mongo/base/init.h"
+#include "mongo/base/status.h"
+#include "mongo/db/server_parameters.h"
 
 namespace mongo {
+namespace repl {
 
-    class RecoveryUnitNoop : public RecoveryUnit {
-    public:
-        // TODO implement rollback
-        virtual void beginUnitOfWork() {}
-        virtual void commitUnitOfWork() {}
-        virtual void endUnitOfWork() {}
-
-        virtual bool commitIfNeeded(bool force = false) {
-            return false;
+    MONGO_EXPORT_STARTUP_SERVER_PARAMETER(maxSyncSourceLagSecs, int, 30);
+    MONGO_INITIALIZER(maxSyncSourceLagSecsCheck) (InitializerContext*) {
+        if (maxSyncSourceLagSecs < 1) {
+            return Status(ErrorCodes::BadValue, "maxSyncSourceLagSecs must be > 0");
         }
+        return Status::OK();
+    }
 
-        virtual bool awaitCommit() {
-            return true;
-        }
-
-        virtual bool isCommitNeeded() const {
-            return false;
-        }
-
-        virtual void registerChange(Change* change) {
-            change->commit();
-            delete change;
-        }
-
-        virtual void* writingPtr(void* data, size_t len) {
-            return data;
-        }
-
-        virtual void syncDataAndTruncateJournal() { }
-    };
-
-}  // namespace mongo
+}
+}
