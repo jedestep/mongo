@@ -59,7 +59,7 @@ namespace mongo {
     // If the number of documents is very small, an extra
     // scan could incur huge additional I/O costs when it would
     // be simpler to just scan all the documents manually.
-    const int NEGATION_SCAN_THRESHOLD = 10;
+    const int NEGATION_SCAN_THRESHOLD = 1000;
 
     struct TextStageParams {
         TextStageParams(const FTSSpec& s) : spec(s) {}
@@ -95,17 +95,10 @@ namespace mongo {
             // 2. Read the terms/scores from the text index.
             READING_TERMS,
 
-<<<<<<< HEAD
             // 3. If the query had negative terms, remove them.
             FILTER_NEGATIVES,
 
             // 4. Return results to our parent.
-=======
-            // 2.5. If the query had negative terms, remove them.
-            FILTER_NEGATIVES,
-
-            // 3. Return results to our parent.
->>>>>>> 01dbfae... refactor text stage for better performance
             RETURNING_RESULTS,
 
             // 5. Done.
@@ -113,7 +106,7 @@ namespace mongo {
         };
 
         TextStage(OperationContext* txn,
-                  const TextStageParams& params,
+                  TextStageParams& params,
                   WorkingSet* ws,
                   const MatchExpression* filter);
 
@@ -138,7 +131,6 @@ namespace mongo {
 
         static const char* kStageType;
     protected:
-<<<<<<< HEAD
         // Maps from diskloc -> aggregate score for doc.
         typedef map<DiskLoc, double> ScoreMap;
         // Comparator class
@@ -148,20 +140,6 @@ namespace mongo {
                     return a.first < b.first;
                 }
         };
-=======
-        // Comparator class for ScoreMap
-        // Maybe should be in diskloc
-        class ScoreMapCompare {
-            public:
-                bool operator()(const DiskLoc& x, const DiskLoc& y) {
-                    return x < y;
-                }
-        };
-
-        // Maps from diskloc -> aggregate score for doc.
-        typedef map<DiskLoc, double, ScoreMapCompare> ScoreMap;
->>>>>>> 01dbfae... refactor text stage for better performance
-
     private:
         /**
          * Initializes sub-scanners.
@@ -177,21 +155,13 @@ namespace mongo {
         /**
          * Helper method to build an index scan and insert it into the given vector.
          */
-<<<<<<< HEAD
         void addScanner(OwnedPointerVector<PlanStage>* scannerVector, const string& term);
-=======
-        void addScanner(OwnedPointerVector<PlanStage>* vec, const string& term);
->>>>>>> 01dbfae... refactor text stage for better performance
         /**
          * Helper called from readFromSubScanners to update aggregate score with a new-found (term,
          * score) pair for this document.  Also rejects documents that don't match this stage's
          * filter.
          */
-<<<<<<< HEAD
         void addTerm(const BSONObj& key, const DiskLoc& loc, ScoreMap* curMap);
-=======
-        void addTerm(const BSONObj& key, const DiskLoc& loc, ScoreMap* sm);
->>>>>>> 01dbfae... refactor text stage for better performance
 
         /**
          * Removes any results that were in a negative scan from the result set.
