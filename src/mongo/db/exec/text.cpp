@@ -276,7 +276,6 @@ namespace mongo {
             if (_startedNegativeScans) {
                 _internalState = FILTER_NEGATIVES;
             }
-
             else {
                 _scoreIterator = _scores.begin();
                 _internalState = RETURNING_RESULTS;
