@@ -230,8 +230,13 @@ namespace mongo {
             }
 
             // If we're here we are done reading results.  Move to the next state.
-            _scoreIterator = _scores.begin();
-            _internalState = RETURNING_RESULTS;
+            if (_startedNegativeScans) {
+                _internalState = FILTER_NEGATIVES;
+            }
+            else {
+                _scoreIterator = _scores.begin();
+                _internalState = RETURNING_RESULTS;
+            }
 
             // Don't need to keep these around.
             _scanners.clear();
