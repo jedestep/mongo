@@ -207,6 +207,8 @@ namespace mongo {
 
         // Transition to the next state.
         _internalState = READING_TERMS;
+        _curScanner = &_scanners;
+        _curScoreMap = &_scores;
         return PlanStage::NEED_TIME;
     }
 
